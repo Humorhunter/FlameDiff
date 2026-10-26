@@ -20,7 +20,7 @@ class FlameAgent(pl.LightningModule):
         '''
         super().__init__()
         self.autoendecoder = AutoEnDecoder()
-        self.autoendecoder.load_state_dict(torch.load(endecoder_ckpt))
+        self.autoendecoder.load_state_dict(torch.load(endecoder_ckpt, map_location="cpu"))
         self.autoendecoder.eval()
         self.autoendecoder.requires_grad_(False)
         self.vitdecoder = ViTDecoder()
@@ -30,7 +30,7 @@ class FlameAgent(pl.LightningModule):
         self.sensors = np.array(sensors) # (8, 2)
         
         if ckpt_path is not None:
-            self.load_state_dict(torch.load(ckpt_path)["state_dict"])
+            self.load_state_dict(torch.load(ckpt_path, map_location="cpu")["state_dict"])
         else:
             print("No checkpoint path is provided. Load the model from scratch.")
 
