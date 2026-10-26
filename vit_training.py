@@ -26,7 +26,7 @@ def main(cfg: DictConfig):
     agent = FlameAgent(**cfg.flame_agent.params)
     agent.max_v = max_v
     agent.min_v = min_v
-    devices=[0, 1, 2, 3, 4, 5, 6, ]
+    devices=[0, 1, 2, 3, ]
     # devices = [0]
     trainer = pl.Trainer(**cfg.trainer, devices=devices, logger=TensorBoardLogger(cfg.log_dir, name=cfg.exp_name), default_root_dir=cfg.log_dir,)
     trainer.fit(agent,

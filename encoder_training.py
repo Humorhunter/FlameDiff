@@ -22,7 +22,7 @@ def main(cfg: DictConfig):
     
     max_v, min_v = dataset.max_min()
     agent = AutoEncoderAgent(max_v=max_v, min_v=min_v)
-    trainer = pl.Trainer(**cfg.trainer, devices=[1, 2, 3, 4, 5, 6, ], logger=TensorBoardLogger(cfg.log_dir, name='autoencoder'), default_root_dir=cfg.log_dir)
+    trainer = pl.Trainer(**cfg.trainer, devices=[0, 1, 2, 3, ], logger=TensorBoardLogger(cfg.log_dir, name='autoencoder'), default_root_dir=cfg.log_dir)
     trainer.fit(agent,
                 train_dataloaders=train_data_loader,
                 val_dataloaders=val_data_loader
