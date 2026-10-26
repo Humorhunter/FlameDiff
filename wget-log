@@ -1,0 +1,11 @@
+--2026-10-26 02:19:16--  https://cloud.tsinghua.edu.cn/d/53775c5811e24cc88ee4/files/?p=%2FH2_Tco_jet_flames_3fields.zip
+Resolving cloud.tsinghua.edu.cn (cloud.tsinghua.edu.cn)... 101.6.15.69, 2402:f000:1:402:101:6:15:69
+Connecting to cloud.tsinghua.edu.cn (cloud.tsinghua.edu.cn)|101.6.15.69|:443... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 7428 (7.3K) [text/html]
+Saving to: ‘index.html?p=%2FH2_Tco_jet_flames_3fields.zip’
+
+                   index.html?p=%2FH2   0%[                                                                        ]       0  --.-KB/s               index.html?p=%2FH2_Tco_jet_flames_3fi 100%[=======================================================================>]   7.25K  --.-KB/s    in 0s      
+
+2026-10-26 02:19:16 (2.69 GB/s) - ‘index.html?p=%2FH2_Tco_jet_flames_3fields.zip’ saved [7428/7428]
+
