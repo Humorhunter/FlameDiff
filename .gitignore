@@ -6,3 +6,4 @@
 /debug/*
 /dataset
 /outputs
+__pycache__/

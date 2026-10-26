@@ -14,7 +14,7 @@ What if we want AI to paint a real turbulant flame field? This make sense!
 
 Install the required enviroment:
 ```
-conda create -f environment.yml
+conda env create -f environment.yml
 ```
 
 ### Running the code
