@@ -362,6 +362,25 @@ class TestSampleMMPS(unittest.TestCase):
         )
         self.assertTrue(torch.equal(out, out_again))
 
+        # Warm-start DDIM must also work without custom timesteps kwarg error
+        sr_op = SpatialObservation("sr")
+        sr_out = sample_mmps(
+            self.denoiser,
+            self.decoder,
+            sr_op.measure,
+            torch.full((1, 1, 48, 64), 0.3),
+            scheduler=build_scheduler(20, sampler="ddim", clip_sample=True),
+            steps=4,
+            sigma=0.05,
+            maxiter=2,
+            seed=9,
+            initial_latent=torch.zeros((1, 1, 48, 64)),
+            strength=0.5,
+            eta=0.0,
+        )
+        self.assertEqual(tuple(sr_out.shape), (1, 1, 192, 256))
+        self.assertTrue(torch.isfinite(sr_out).all().item())
+
     def test_warm_start_inpaint_and_sr(self) -> None:
         init_latent = torch.zeros((1, 1, 48, 64))
 

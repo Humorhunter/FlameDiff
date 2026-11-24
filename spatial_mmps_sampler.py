@@ -23,6 +23,17 @@ def _validate_positive_int(name, value):
         raise ValueError(f"{name} must be a positive integer")
 
 
+def _set_custom_timesteps(scheduler, active_schedule):
+    if "timesteps" in inspect.signature(scheduler.set_timesteps).parameters:
+        scheduler.set_timesteps(timesteps=active_schedule)
+    else:
+        scheduler.timesteps = torch.tensor(
+            active_schedule,
+            dtype=scheduler.timesteps.dtype,
+            device=scheduler.timesteps.device,
+        )
+
+
 def _warm_timesteps(scheduler, steps, strength):
     try:
         strength = float(strength)
@@ -34,7 +45,7 @@ def _warm_timesteps(scheduler, steps, strength):
     full_schedule = scheduler.timesteps.tolist()
     active_count = max(1, ceil(steps * strength))
     active_schedule = full_schedule[-active_count:]
-    scheduler.set_timesteps(timesteps=active_schedule)
+    _set_custom_timesteps(scheduler, active_schedule)
     return scheduler.timesteps.tolist()
 
 
@@ -220,7 +231,8 @@ def sample_mmps(
         latent = scheduler.add_noise(initial_latent.detach(), noise, start_timestep)
     else:
         if steps == 1:
-            scheduler.set_timesteps(timesteps=[scheduler.config.num_train_timesteps - 1])
+            scheduler.set_timesteps(1)
+            _set_custom_timesteps(scheduler, [scheduler.config.num_train_timesteps - 1])
         else:
             scheduler.set_timesteps(steps)
         latent = torch.randn(
