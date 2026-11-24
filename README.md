@@ -37,6 +37,56 @@ python vit_training.py exp_name=vit trainer.max_epochs=10000
 
 ## Single-frame spatial benchmark
 
+### Shared latent MMPS reconstruction
+
+Use `spatial_mmps_reconstruct.py` to reconstruct one temperature field
+from eight sensors, a center mask, or a 4× coarse grid. The three tasks
+share the same unconditional spatial prior checkpoint (from
+`spatial.py train prior`) and its embedded autoencoder.
+
+| `--task` | Kelvin `.npy` input |
+| --- | --- |
+| `sensors` | Shape `(8,)` in the `(x, y)` order in `config/default_training.yaml` |
+| `inpaint` | Shape `(192, 256)`. Values at rows `[48, 144)` and columns `[64, 192)` are ignored and may be NaN. |
+| `sr` | Shape `(48, 64)`, the means of non-overlapping `4×4` blocks |
+
+```sh
+python spatial_mmps_reconstruct.py reconstruct --task sr \
+  --checkpoint outputs/spatial/prior.pt --observation coarse.npy \
+  --output temperature.npy --device cuda
+```
+
+The output is a `(192, 256)` array in Kelvin. The final field copies known
+pixels for the sensor and inpainting tasks, and restores block averages for
+SR. The console reports observation RMSE before and after that projection
+and the GMRES diagnostics. This assumes exact input measurements.
+
+The default initializations are noise for sensors, harmonic interpolation for
+inpainting, and block-mean-corrected bicubic interpolation for SR. The warm
+initializations use the last 25% and 10% of the diffusion schedule,
+respectively. Use `--warm-strength 0` to start from noise for either task.
+`--sigma-k` controls the MMPS likelihood regularization scale in Kelvin.
+Defaults are 5% of the checkpoint temperature span for sensors and 10 K for
+the other two tasks. These are starting settings for validation. The MMPS
+linear solve uses a finite iteration budget, and convergence is reported.
+
+```sh
+python spatial_mmps_reconstruct.py evaluate --task inpaint \
+  --checkpoint outputs/spatial/prior.pt --data ../H2_Tco_jet_flames_3fields \
+  --output outputs/spatial/mmps-inpaint-val.json --device cuda --resume
+```
+
+Evaluation uses the middle slice and middle validation frame of each
+case. It measures errors over unmeasured pixels for sensors, the missing
+rectangle for inpainting, and the full field for SR, reporting both raw
+and projected results for MAE, RMSE, gradient MAE (plus boundary gradient
+MAE for inpainting), SSIM, hot-zone MAE/RMSE/IoU/Dice at 1000 K and
+1200 K, observation RMSE, and GMRES diagnostics. Progress is written
+atomically after each frame (`status: "running"` until `"complete"`), and
+`--resume` skips already-completed compatible frames.
+
+### DPS and spatial benchmark
+
 `spatial.py` adds a separate workflow for centered inpainting and 4× spatial
 super-resolution. The original eight-sensor training and inference path still
 uses sensor tokens. The spatial workflow trains an unconditional prior with the
@@ -184,6 +234,6 @@ bands, and per-case results for both individual draws and their mean.
 On a CUDA instance with the data and the inpainting U-Net checkpoint in the
 default locations, run `bash run_inpaint_ablation.sh`. The runner performs a
 small CUDA smoke check for both variants before starting the matched training
-runs and evaluating epochs 10 and 20 on the same 45 validation frames.
+runs and evaluating epochs 10, 20, and 30 on the same 45 validation frames.
 Override the data and base checkpoint with `FLAMEDIFF_DATA` and
 `FLAMEDIFF_INPAINT_UNET` if needed.
