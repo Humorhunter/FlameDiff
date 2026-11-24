@@ -244,6 +244,23 @@ def sample_mmps(
                     generator=generator,
                 ).prev_sample
 
+                if diagnostics is not None:
+                    clip_bound = float(getattr(scheduler.config, "clip_sample_range", 1.0))
+                    clean_oob = float((clean.detach().abs() > clip_bound).float().mean().item())
+                    posterior_clean = (
+                        current.detach() - (1 - alpha_bar).sqrt() * conditioned_noise
+                    ) / alpha_bar.sqrt()
+                    posterior_clipped = (
+                        float((posterior_clean.abs() > clip_bound).float().mean().item())
+                        if getattr(scheduler.config, "clip_sample", False)
+                        else 0.0
+                    )
+                    eps_norm = float(torch.linalg.vector_norm(predicted_noise.detach()).item())
+                    corr_norm = float(
+                        torch.linalg.vector_norm((1 - alpha_bar).sqrt() * score).item()
+                    )
+                    score_ratio = corr_norm / max(eps_norm, 1e-12)
+
             total_gmres_iterations += int(solver["iterations"])
             if diagnostics is not None:
                 diagnostics({
@@ -254,6 +271,9 @@ def sample_mmps(
                     "timestep": int(timestep),
                     "measurement_dimension": int(observation_dimension),
                     "measurement_rmse": solver["measurement_rmse"],
+                    "clean_out_of_unit_box_fraction": clean_oob,
+                    "posterior_clipped_fraction": posterior_clipped,
+                    "score_to_noise_norm_ratio": score_ratio,
                 })
             del current, predicted_noise, clean, score, conditioned_noise
     finally:

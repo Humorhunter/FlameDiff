@@ -3,6 +3,7 @@
 from math import isfinite, sqrt
 
 import torch
+from torch.autograd import forward_ad
 
 
 _GMRES_TOLERANCE = 1e-5
@@ -234,14 +235,13 @@ def mmps_guidance(
 
     def measurement_jvp(tangent):
         tangent = tangent.to(dtype=clean.dtype)
-        _, result = torch.autograd.functional.jvp(
-            measure,
-            clean.detach(),
-            tangent.detach(),
-            create_graph=False,
-            strict=False,
-        )
-        return result
+        with torch.no_grad(), forward_ad.dual_level():
+            dual_input = forward_ad.make_dual(clean.detach(), tangent.detach())
+            dual_output = measure(dual_input)
+            result = forward_ad.unpack_dual(dual_output).tangent
+            if result is None:
+                return torch.zeros_like(dual_output)
+            return result
 
     def covariance_measurement_product(vector):
         latent_vector = measurement_vjp(vector)

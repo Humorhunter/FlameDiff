@@ -3,12 +3,15 @@ import torch.nn as nn
 import math
 from torch.nn import functional as F
 
-def timestep_embedding(timesteps, dim):
+def timestep_embedding(timesteps, dim, dtype=torch.float32):
     half_dim = dim // 2
-    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * (-math.log(10000) / (half_dim - 1))).to(timesteps.device) # (d_model // 2)
-    emb = timesteps * emb[None, :]
+    emb = torch.exp(
+        torch.arange(half_dim, dtype=dtype, device=timesteps.device)
+        * (-math.log(10000) / (half_dim - 1))
+    )
+    emb = timesteps.to(dtype=dtype) * emb[None, :]
     emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
-    return emb 
+    return emb
 
 class ViTDecoder(nn.Module):
     def __init__(self, d_model=256, img_size=(48, 64), num_heads=8, num_layers=8, num_feats=8):
@@ -126,7 +129,7 @@ class ViTDecoder(nn.Module):
         B, C, H, W = feat3.shape
         feat3_flat = feat3.flatten(2).transpose(1, 2)  
 
-        t_embed = timestep_embedding(t, self.d_model)
+        t_embed = timestep_embedding(t, self.d_model, dtype=x.dtype)
         t_embed = self.time_embed(t_embed).unsqueeze(1) # (B, 1, d_model)
           
         # f_embed = self.feat_embed(f).unsqueeze(1) # (B, 8) -> (B, 1, d_model)
@@ -135,7 +138,7 @@ class ViTDecoder(nn.Module):
         if self.num_feats:
             if f is None or f.shape != (B, self.num_feats):
                 raise ValueError(f"Expected {self.num_feats} sensor values per sample")
-            features = self.feat_mlp(f.unsqueeze(-1).float())
+            features = self.feat_mlp(f.unsqueeze(-1).to(dtype=x.dtype))
             tokens = torch.cat([tokens, features], dim=1)
         elif f is not None:
             raise ValueError("The unconditional model does not take sensor values")

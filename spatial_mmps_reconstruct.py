@@ -5,6 +5,7 @@ from hashlib import sha256
 import json
 from math import isfinite
 from pathlib import Path
+import re
 from statistics import mean, median
 from time import perf_counter
 
@@ -25,6 +26,26 @@ from spatial_sr_diagnostic import validation_panel
 TASKS = ("sensors", "inpaint", "sr")
 WARM_DEFAULT = {"sensors": 0.0, "inpaint": 0.25, "sr": 0.1}
 HOT_THRESHOLDS_K = (1000.0, 1200.0)
+REQUIRED_METRIC_KEYS = frozenset({
+    "mae_k",
+    "rmse_k",
+    "gradient_mae_k_per_grid_cell",
+    "boundary_gradient_mae_k_per_grid_cell",
+    "ssim",
+    "observation_rmse_k",
+    *(
+        f"hot_{kind}_{int(threshold)}k{unit}"
+        for threshold in HOT_THRESHOLDS_K
+        for kind, unit in (("mae", "_k"), ("rmse", "_k"), ("iou", ""), ("dice", ""))
+    ),
+})
+
+
+def parse_device(value: str) -> str:
+    """Validate CLI --device values: cpu, cuda, or cuda:<non-negative int>."""
+    if value in ("cpu", "cuda") or re.fullmatch(r"cuda:\d+", value):
+        return value
+    raise argparse.ArgumentTypeError("device must be 'cpu', 'cuda', or 'cuda:<index>'")
 
 
 def _file_sha256(path: Path) -> str:
@@ -74,8 +95,15 @@ def aggregate_metric_rows(metric_rows: list[dict[str, float | None]]) -> dict[st
     """Average each metric key across frames, skipping ``None`` entries."""
     if not metric_rows:
         return {}
+    keys: list[str] = []
+    seen: set[str] = set()
+    for row in metric_rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
     summary: dict[str, float | None] = {}
-    for key in metric_rows[0]:
+    for key in keys:
         values = [row[key] for row in metric_rows if row.get(key) is not None]
         summary[key] = float(mean(values)) if values else None
     return summary
@@ -91,6 +119,7 @@ def _load_resume_rows(
     expected_settings: dict,
     checkpoint_sha256: str,
     epoch: int,
+    target_keys: set[tuple[str, str, int, int]] | None = None,
 ) -> dict[tuple[str, str, int, int], dict]:
     """Load compatible completed per-frame rows from an existing evaluation JSON."""
     if not path.exists():
@@ -121,13 +150,30 @@ def _load_resume_rows(
             f"(existing={existing.get('epoch')!r}, current={epoch!r})"
         )
     existing_sha = existing.get("checkpoint_sha256")
-    if existing_sha is not None and existing_sha != checkpoint_sha256:
-        raise ValueError(f"Cannot resume {path}: checkpoint SHA-256 mismatch")
+    if existing_sha != checkpoint_sha256:
+        raise ValueError(
+            f"Cannot resume {path}: missing or mismatched checkpoint SHA-256"
+        )
 
     resumed: dict[tuple[str, str, int, int], dict] = {}
     for row in existing.get("per_frame", []):
+        for section in ("metrics", "raw_metrics"):
+            section_data = row.get(section)
+            if not isinstance(section_data, dict) or not REQUIRED_METRIC_KEYS.issubset(section_data):
+                raise ValueError(
+                    f"Cannot resume {path}: row for {row.get('case')!r} has an incomplete "
+                    f"{section!r} schema; start a fresh output file instead"
+                )
         key = _row_key(row, row["seed"])
         resumed[key] = row
+
+    if target_keys is not None:
+        extra_keys = set(resumed) - target_keys
+        if extra_keys:
+            raise ValueError(
+                f"Cannot resume {path}: existing file contains {len(extra_keys)} completed "
+                f"frame(s) outside the requested selection (refusing to truncate)"
+            )
     return resumed
 
 
@@ -144,15 +190,21 @@ class TemperatureReconstructor:
             raise ValueError("Checkpoint temperature bounds must be finite and increasing")
 
         self.device = torch.device(args.device)
-        if self.device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA is unavailable. Select --device cpu or use a CUDA instance.")
+        if self.device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise ValueError("CUDA is unavailable. Select --device cpu or use a CUDA instance.")
+            if self.device.index is not None and self.device.index >= torch.cuda.device_count():
+                raise ValueError(
+                    f"CUDA device index {self.device.index} is out of range "
+                    f"(found {torch.cuda.device_count()} device(s))"
+                )
         self.operator = SpatialObservation(args.task)
         self.prior = ViTDecoder(**model_config).to(self.device).eval().requires_grad_(False)
         self.prior.load_state_dict(checkpoint["weights"])
         self.autoencoder = load_autoencoder(checkpoint["ae_weights"], self.device)
-        self.scheduler = diffusion_scheduler(checkpoint["diffusion_steps"])
+        self.diffusion_steps = int(checkpoint["diffusion_steps"])
         self.steps = args.steps
-        if not 2 <= self.steps <= self.scheduler.config.num_train_timesteps:
+        if not 2 <= self.steps <= self.diffusion_steps:
             raise ValueError("--steps must be between 2 and the checkpoint's diffusion step count")
         self.maxiter = args.maxiter
         self.seed = args.seed
@@ -216,9 +268,10 @@ class TemperatureReconstructor:
                 }
 
         diagnostics = []
+        scheduler = diffusion_scheduler(self.diffusion_steps)
         raw_normalized = sample_mmps(
             self.prior, self.autoencoder.decoder, measure, measured,
-            scheduler=self.scheduler, steps=self.steps, sigma=self.sigma_k / self.span,
+            scheduler=scheduler, steps=self.steps, sigma=self.sigma_k / self.span,
             maxiter=self.maxiter, generator=torch.Generator(device=self.device).manual_seed(seed),
             diagnostics=diagnostics.append, **initial,
         )
@@ -227,6 +280,21 @@ class TemperatureReconstructor:
         self.operator.validate_field(projected, finite=True)
         steps = [record for record in diagnostics if record["phase"] == "step"]
         residuals = [step["relative_residual"] for step in steps]
+        clean_oob = [
+            step["clean_out_of_unit_box_fraction"]
+            for step in steps
+            if "clean_out_of_unit_box_fraction" in step
+        ]
+        posterior_clipped = [
+            step["posterior_clipped_fraction"]
+            for step in steps
+            if "posterior_clipped_fraction" in step
+        ]
+        score_ratios = [
+            step["score_to_noise_norm_ratio"]
+            for step in steps
+            if "score_to_noise_norm_ratio" in step
+        ]
         return projected, raw, {
             "observation_rmse_k_before_projection": self.observation_rmse(raw, observation),
             "observation_rmse_k_after_projection": self.observation_rmse(projected, observation),
@@ -234,6 +302,9 @@ class TemperatureReconstructor:
             "solver_converged_steps": sum(bool(step["converged"]) for step in steps),
             "solver_median_relative_residual": median(residuals) if residuals else None,
             "solver_max_relative_residual": max(residuals) if residuals else None,
+            "max_clean_out_of_unit_box_fraction": max(clean_oob) if clean_oob else None,
+            "max_posterior_clipped_fraction": max(posterior_clipped) if posterior_clipped else None,
+            "max_score_to_noise_norm_ratio": max(score_ratios) if score_ratios else None,
         }
 
     def observation_rmse(self, field, observation):
@@ -279,6 +350,7 @@ def build_evaluation_report(
     target_frames: int,
     rows: list[dict],
     status: str,
+    peak_cuda_memory_mb: float | None = None,
 ) -> dict:
     """Assemble the evaluation JSON payload for incremental or final saves."""
     summary_metrics = aggregate_metric_rows([row["metrics"] for row in rows])
@@ -287,6 +359,21 @@ def build_evaluation_report(
         row["solver_median_relative_residual"]
         for row in rows
         if row.get("solver_median_relative_residual") is not None
+    ]
+    clean_oob = [
+        row["max_clean_out_of_unit_box_fraction"]
+        for row in rows
+        if row.get("max_clean_out_of_unit_box_fraction") is not None
+    ]
+    posterior_clipped = [
+        row["max_posterior_clipped_fraction"]
+        for row in rows
+        if row.get("max_posterior_clipped_fraction") is not None
+    ]
+    score_ratios = [
+        row["max_score_to_noise_norm_ratio"]
+        for row in rows
+        if row.get("max_score_to_noise_norm_ratio") is not None
     ]
     return {
         **settings,
@@ -306,6 +393,7 @@ def build_evaluation_report(
         "mean_rmse_k": summary_metrics.get("rmse_k"),
         "mean_raw_rmse_k": summary_raw_metrics.get("rmse_k"),
         "mean_seconds_per_frame": float(mean(row["seconds"] for row in rows)) if rows else None,
+        "peak_cuda_memory_mb": peak_cuda_memory_mb,
         "summary_metrics": summary_metrics,
         "summary_raw_metrics": summary_raw_metrics,
         "summary_observation": {
@@ -320,6 +408,11 @@ def build_evaluation_report(
             "total_solver_steps": sum(int(row["solver_steps"]) for row in rows),
             "total_solver_converged_steps": sum(int(row["solver_converged_steps"]) for row in rows),
             "median_solver_relative_residual": float(median(residuals)) if residuals else None,
+            "max_clean_out_of_unit_box_fraction": float(max(clean_oob)) if clean_oob else None,
+            "max_posterior_clipped_fraction": (
+                float(max(posterior_clipped)) if posterior_clipped else None
+            ),
+            "max_score_to_noise_norm_ratio": float(max(score_ratios)) if score_ratios else None,
         },
         "per_frame": rows,
     }
@@ -362,16 +455,25 @@ def evaluate(args):
     for index, sample in enumerate(samples):
         by_case.setdefault(sample["case"], []).append(index)
     selected_indices = [group[len(group) // 2] for group in by_case.values()][:args.limit]
+    target_keys = {_row_key(samples[index], args.seed + index) for index in selected_indices}
     resumed_rows = (
         _load_resume_rows(
             args.output,
             expected_settings=settings,
             checkpoint_sha256=checkpoint_sha256,
             epoch=checkpoint["epoch"],
+            target_keys=target_keys,
         )
         if getattr(args, "resume", False)
         else {}
     )
+    if model.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(model.device)
+
+    def _peak_cuda_mb() -> float | None:
+        if model.device.type != "cuda":
+            return None
+        return float(torch.cuda.max_memory_allocated(model.device) / (1024.0 * 1024.0))
 
     rows = []
     for index in selected_indices:
@@ -413,6 +515,7 @@ def evaluate(args):
             target_frames=len(selected_indices),
             rows=rows,
             status="running",
+            peak_cuda_memory_mb=_peak_cuda_mb(),
         )
         _write_json_atomic(args.output, partial)
 
@@ -425,6 +528,7 @@ def evaluate(args):
         target_frames=len(selected_indices),
         rows=rows,
         status="complete",
+        peak_cuda_memory_mb=_peak_cuda_mb(),
     )
     _write_json_atomic(args.output, result)
     print(json.dumps({key: value for key, value in result.items() if key != "per_frame"},
@@ -447,7 +551,7 @@ def main():
         command.add_argument("--task", choices=TASKS, required=True)
         command.add_argument("--checkpoint", type=Path, required=True, help="Unconditional spatial prior")
         command.add_argument("--output", type=Path, required=True)
-        command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+        command.add_argument("--device", type=parse_device, default="cpu", help="cpu, cuda, or cuda:<index>")
         command.add_argument("--seed", type=int, default=0)
         command.add_argument("--steps", type=positive_int, default=20)
         command.add_argument("--sigma-k", type=float, help="MMPS likelihood regularization scale in Kelvin")

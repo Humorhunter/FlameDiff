@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import tempfile
@@ -14,9 +15,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.EnDeCoder import AutoDecoder
+from model.ViTDecoder import ViTDecoder
 from spatial_dps import diffusion_scheduler
+from spatial_mmps import mmps_guidance
 from spatial_mmps_observation import DEFAULT_SENSOR_COORDS_XY, SpatialObservation
 from spatial_mmps_reconstruct import (
+    REQUIRED_METRIC_KEYS,
     TemperatureReconstructor,
     _file_sha256,
     _load_resume_rows,
@@ -26,6 +31,7 @@ from spatial_mmps_reconstruct import (
     build_evaluation_report,
     evaluate,
     hot_zone_metrics,
+    parse_device,
 )
 from spatial_mmps_sampler import sample_mmps
 
@@ -147,6 +153,16 @@ class TestSpatialObservation(unittest.TestCase):
         with self.assertRaises(ValueError):
             op.measure(torch.zeros((1, 1, 64, 64)))
 
+    def test_mask_cache_is_isolated_from_caller_mutation(self) -> None:
+        for task in ("sensors", "inpaint", "sr"):
+            op = SpatialObservation(task)
+            ref = torch.zeros((2, 1, 192, 256))
+            m1 = op.mask(ref)
+            original = m1.clone()
+            m1.fill_(not bool(m1[0, 0, 0, 0].item()))
+            m2 = op.mask(ref)
+            self.assertTrue(torch.equal(m2, original))
+
 
 class TestSampleMMPS(unittest.TestCase):
     def setUp(self) -> None:
@@ -204,6 +220,59 @@ class TestSampleMMPS(unittest.TestCase):
         self.assertEqual(len(summary_records), 1)
         self.assertEqual(summary_records[0]["measurement_dimension"], 8)
         self.assertTrue(math.isfinite(summary_records[0]["raw_observation_rmse"]))
+        for rec in step_records:
+            self.assertIn("clean_out_of_unit_box_fraction", rec)
+            self.assertIn("posterior_clipped_fraction", rec)
+            self.assertIn("score_to_noise_norm_ratio", rec)
+            self.assertGreaterEqual(rec["clean_out_of_unit_box_fraction"], 0.0)
+            self.assertLessEqual(rec["clean_out_of_unit_box_fraction"], 1.0)
+            self.assertGreaterEqual(rec["posterior_clipped_fraction"], 0.0)
+            self.assertLessEqual(rec["posterior_clipped_fraction"], 1.0)
+            self.assertGreaterEqual(rec["score_to_noise_norm_ratio"], 0.0)
+
+    def test_forward_ad_jvp_matches_reference_and_handles_constant_measure(self) -> None:
+        decoder = AutoDecoder().eval().requires_grad_(False)
+        op = SpatialObservation("sr")
+        current = torch.randn((1, 1, 48, 64), requires_grad=True)
+        clean = 0.8 * current
+        obs = torch.zeros((1, 1, 48, 64))
+
+        score, diag = mmps_guidance(
+            current,
+            clean,
+            obs,
+            lambda z: op.measure(decoder(z)),
+            alpha_bar=0.5,
+            sigma=0.1,
+            maxiter=2,
+        )
+        self.assertEqual(tuple(score.shape), (1, 1, 48, 64))
+        self.assertTrue(torch.isfinite(score).all().item())
+        self.assertGreaterEqual(diag["iterations"], 1.0)
+
+        # Dead-ReLU / zero-derivative measure must produce finite zero score cleanly
+        const_obs = torch.ones((1, 4))
+        const_score, const_diag = mmps_guidance(
+            current,
+            clean,
+            const_obs,
+            lambda z: F.relu(z.flatten(1)[:, :4] - 1e6),
+            alpha_bar=0.5,
+            sigma=0.1,
+            maxiter=2,
+        )
+        self.assertEqual(float(const_score.abs().max().item()), 0.0)
+        self.assertTrue(math.isfinite(const_diag["relative_residual"]))
+
+    def test_vit_decoder_supports_float64(self) -> None:
+        model = ViTDecoder(d_model=32, num_heads=4, num_layers=1, num_feats=0).double().eval()
+        latent = torch.randn((1, 1, 48, 64), dtype=torch.float64)
+        timestep = torch.tensor([[10]], dtype=torch.long)
+        with torch.no_grad():
+            out = model(latent, None, timestep)
+        self.assertEqual(out.dtype, torch.float64)
+        self.assertEqual(tuple(out.shape), (1, 1, 48, 64))
+        self.assertTrue(torch.isfinite(out).all().item())
 
     def test_warm_start_inpaint_and_sr(self) -> None:
         init_latent = torch.zeros((1, 1, 48, 64))
@@ -381,13 +450,22 @@ class TestMetricsAndResume(unittest.TestCase):
             # Must serialize cleanly without NaN
             json.dumps(m, allow_nan=False)
 
+    def test_parse_device(self) -> None:
+        for valid in ("cpu", "cuda", "cuda:0", "cuda:12"):
+            self.assertEqual(parse_device(valid), valid)
+        for invalid in ("mps", "cuda:-1", "cuda:abc", "gpu", "cuda:"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                parse_device(invalid)
+
     def test_aggregate_and_resume_compatibility(self) -> None:
+        # Union of keys across rows must preserve keys appearing only in later rows
         agg = aggregate_metric_rows([
             {"rmse_k": 10.0, "hot_iou_1200k": None},
-            {"rmse_k": 20.0, "hot_iou_1200k": 0.8},
+            {"rmse_k": 20.0, "hot_iou_1200k": 0.8, "extra_metric": 3.0},
         ])
         self.assertAlmostEqual(agg["rmse_k"], 15.0)
         self.assertAlmostEqual(agg["hot_iou_1200k"], 0.8)
+        self.assertAlmostEqual(agg["extra_metric"], 3.0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -407,6 +485,7 @@ class TestMetricsAndResume(unittest.TestCase):
                 "warm_strength": 0.0,
                 "seed": 0,
             }
+            full_metrics = {key: (None if "1200k" in key or "boundary" in key else 1.0) for key in REQUIRED_METRIC_KEYS}
             sample_row = {
                 "case": "T1030",
                 "slice": "s0",
@@ -420,8 +499,8 @@ class TestMetricsAndResume(unittest.TestCase):
                 "solver_converged_steps": 5,
                 "solver_median_relative_residual": 1e-4,
                 "solver_max_relative_residual": 1e-2,
-                "metrics": {"rmse_k": 100.0, "hot_iou_1200k": None},
-                "raw_metrics": {"rmse_k": 101.0, "hot_iou_1200k": None},
+                "metrics": dict(full_metrics),
+                "raw_metrics": dict(full_metrics),
             }
             report = build_evaluation_report(
                 settings=settings,
@@ -441,11 +520,22 @@ class TestMetricsAndResume(unittest.TestCase):
                 expected_settings=settings,
                 checkpoint_sha256=ckpt_sha,
                 epoch=19,
+                target_keys={_row_key(sample_row, 0), ("T1040", "s0", 150, 1)},
             )
             self.assertEqual(len(resumed), 1)
             self.assertIn(_row_key(sample_row, 0), resumed)
 
-            # Mismatched settings must raise
+            # Refuses to truncate when existing file has completed frames outside target_keys
+            with self.assertRaises(ValueError):
+                _load_resume_rows(
+                    out_path,
+                    expected_settings=settings,
+                    checkpoint_sha256=ckpt_sha,
+                    epoch=19,
+                    target_keys={("T1040", "s0", 150, 1)},
+                )
+
+            # Mismatched settings / SHA must raise
             bad_settings = {**settings, "steps": 50}
             with self.assertRaises(ValueError):
                 _load_resume_rows(
@@ -459,6 +549,31 @@ class TestMetricsAndResume(unittest.TestCase):
                     out_path,
                     expected_settings=settings,
                     checkpoint_sha256="deadbeef",
+                    epoch=19,
+                )
+
+            # Legacy file lacking checkpoint_sha256 or incomplete metric schema must raise
+            legacy_path = tmp / "legacy.json"
+            legacy_report = dict(report)
+            legacy_report.pop("checkpoint_sha256")
+            _write_json_atomic(legacy_path, legacy_report)
+            with self.assertRaises(ValueError):
+                _load_resume_rows(
+                    legacy_path,
+                    expected_settings=settings,
+                    checkpoint_sha256=ckpt_sha,
+                    epoch=19,
+                )
+
+            incomplete_path = tmp / "incomplete.json"
+            incomplete_row = dict(sample_row, metrics={"rmse_k": 100.0, "mae_k": 80.0})
+            incomplete_report = dict(report, per_frame=[incomplete_row])
+            _write_json_atomic(incomplete_path, incomplete_report)
+            with self.assertRaises(ValueError):
+                _load_resume_rows(
+                    incomplete_path,
+                    expected_settings=settings,
+                    checkpoint_sha256=ckpt_sha,
                     epoch=19,
                 )
 

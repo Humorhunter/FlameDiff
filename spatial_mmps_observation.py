@@ -96,6 +96,40 @@ class SpatialObservation:
         # Flattened indices use standard row-major image order, converting the
         # public/config (x, y) coordinates to index y * width + x.
         self._sensor_indices_cpu = tuple(y * self.width + x for x, y in self.sensor_coords_xy)
+        self._sensor_indices_cache: dict[torch.device, torch.Tensor] = {}
+        self._sensor_pixel_mask_cache: dict[torch.device, torch.Tensor] = {}
+        self._base_mask_cache: dict[torch.device, torch.Tensor] = {}
+
+    def _sensor_indices(self, device: torch.device) -> torch.Tensor:
+        indices = self._sensor_indices_cache.get(device)
+        if indices is None:
+            indices = torch.tensor(self._sensor_indices_cpu, dtype=torch.long, device=device)
+            self._sensor_indices_cache[device] = indices
+        return indices
+
+    def _sensor_pixel_mask(self, device: torch.device) -> torch.Tensor:
+        pixel_mask = self._sensor_pixel_mask_cache.get(device)
+        if pixel_mask is None:
+            indices = self._sensor_indices(device)
+            pixel_mask = torch.zeros(
+                (1, 1, self.height * self.width), dtype=torch.bool, device=device
+            ).scatter(2, indices.view(1, 1, -1), True)
+            self._sensor_pixel_mask_cache[device] = pixel_mask
+        return pixel_mask
+
+    def _base_mask(self, device: torch.device) -> torch.Tensor:
+        mask = self._base_mask_cache.get(device)
+        if mask is None:
+            mask = torch.ones((1, 1, self.height, self.width), dtype=torch.bool, device=device)
+            if self.task == "inpaint":
+                mask[..., self.y0:self.y1, self.x0:self.x1] = False
+            elif self.task == "sensors":
+                mask.zero_()
+                ys = torch.tensor([y for _, y in self.sensor_coords_xy], dtype=torch.long, device=device)
+                xs = torch.tensor([x for x, _ in self.sensor_coords_xy], dtype=torch.long, device=device)
+                mask[:, 0, ys, xs] = True
+            self._base_mask_cache[device] = mask
+        return mask
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -193,25 +227,17 @@ class SpatialObservation:
             self._check_image(reference)
             batch_size, device = reference.shape[0], reference.device
 
-        mask = torch.ones((batch_size, 1, self.height, self.width), dtype=torch.bool, device=device)
-        if self.task == "inpaint":
-            mask[..., self.y0:self.y1, self.x0:self.x1] = False
-        elif self.task == "sensors":
-            mask.zero_()
-            ys = torch.tensor([y for _, y in self.sensor_coords_xy], device=device)
-            xs = torch.tensor([x for x, _ in self.sensor_coords_xy], device=device)
-            mask[:, 0, ys, xs] = True
-        return mask
+        return self._base_mask(device).expand(batch_size, -1, -1, -1).clone()
 
     def measure(self, field: torch.Tensor) -> torch.Tensor:
         """Apply ``A`` to a batch of fields while preserving gradients."""
         self._check_image(field)
         if self.task == "sensors":
-            indices = torch.tensor(self._sensor_indices_cpu, dtype=torch.long, device=field.device)
+            indices = self._sensor_indices(field.device)
             return field[:, 0].flatten(1).index_select(1, indices)
         if self.task == "inpaint":
             zero = torch.zeros((), dtype=field.dtype, device=field.device)
-            return torch.where(self.mask(field), field, zero)
+            return torch.where(self._base_mask(field.device), field, zero)
         return F.avg_pool2d(field, kernel_size=self.scale, stride=self.scale)
 
     def adjoint(self, observation: torch.Tensor) -> torch.Tensor:
@@ -224,14 +250,12 @@ class SpatialObservation:
                 dtype=observation.dtype,
                 device=observation.device,
             )
-            indices = torch.tensor(
-                self._sensor_indices_cpu, dtype=torch.long, device=observation.device
-            )
+            indices = self._sensor_indices(observation.device)
             flat = flat.scatter(1, indices.expand(batch_size, -1), observation)
             return flat.reshape(batch_size, 1, self.height, self.width)
         if self.task == "inpaint":
             zero = torch.zeros((), dtype=observation.dtype, device=observation.device)
-            return torch.where(self.mask(observation), observation, zero)
+            return torch.where(self._base_mask(observation.device), observation, zero)
         repeated = observation.repeat_interleave(self.scale, dim=-2)
         repeated = repeated.repeat_interleave(self.scale, dim=-1)
         return repeated / (self.scale**2)
@@ -252,16 +276,14 @@ class SpatialObservation:
 
         if self.task == "sensors":
             flat_field = field.flatten(2)
-            indices = torch.tensor(self._sensor_indices_cpu, dtype=torch.long, device=field.device)
-            pixel_mask = torch.zeros(
-                (1, 1, self.height * self.width), dtype=torch.bool, device=field.device
-            ).scatter(2, indices.view(1, 1, -1), True)
+            indices = self._sensor_indices(field.device)
+            pixel_mask = self._sensor_pixel_mask(field.device)
             measured = torch.zeros_like(flat_field).scatter(
                 2, indices.view(1, 1, -1).expand(field.shape[0], -1, -1), observation.unsqueeze(1)
             )
             return torch.where(pixel_mask, measured, flat_field).reshape_as(field)
         if self.task == "inpaint":
-            return torch.where(self.mask(field), observation, field)
+            return torch.where(self._base_mask(field.device), observation, field)
 
         discrepancy = observation - self.measure(field)
         correction = discrepancy.repeat_interleave(self.scale, dim=-2)
