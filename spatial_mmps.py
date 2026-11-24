@@ -30,7 +30,7 @@ def _require_finite(name, value):
         raise FloatingPointError(f"MMPS encountered non-finite values in {name}")
 
 
-def _gmres(operator, rhs, maxiter, *, tolerance=_GMRES_TOLERANCE):
+def _gmres(operator, rhs, maxiter, *, tolerance=_GMRES_TOLERANCE, verify_residual=False):
     """Solve a small matrix-free system with modified Gram-Schmidt GMRES."""
     shape = rhs.shape
     b = rhs.reshape(-1)
@@ -139,9 +139,12 @@ def _gmres(operator, rhs, maxiter, *, tolerance=_GMRES_TOLERANCE):
                 solution = solution + coefficient * basis[index]
 
     _require_finite("the GMRES solution", solution)
-    actual_residual = b - operator(solution.reshape(shape)).reshape(-1)
-    _require_finite("the GMRES residual", actual_residual)
-    relative_residual = float((torch.linalg.vector_norm(actual_residual) / beta).item())
+    if verify_residual or breakdown or iterations == 0:
+        actual_residual = b - operator(solution.reshape(shape)).reshape(-1)
+        _require_finite("the GMRES residual", actual_residual)
+        relative_residual = float((torch.linalg.vector_norm(actual_residual) / beta).item())
+    else:
+        relative_residual = float((g[iterations].abs() / beta).item())
     return solution.reshape(shape), {
         "relative_residual": relative_residual,
         "iterations": float(iterations),
@@ -159,6 +162,8 @@ def mmps_guidance(
     *,
     sigma,
     maxiter,
+    solver_space="auto",
+    verify_residual=False,
 ):
     """Compute a local-linearized MMPS likelihood score without dense Jacobians.
 
@@ -167,6 +172,12 @@ def mmps_guidance(
     applied as ``((1-alpha_bar)/sqrt(alpha_bar)) * J_mu.T``. The covariance is
     held fixed during the GMRES solve, as in MMPS; only first derivatives of
     the denoiser-derived ``clean`` tensor are used.
+
+    When ``solver_space="auto"``, systems with more scalar observations than
+    latent coordinates (e.g. center inpainting, 36,864 > 3,072) are solved in
+    latent space via the exact Woodbury push-through identity
+    ``J_f^T (sigma^2 I_m + J_f S J_f^T)^{-1} r = (sigma^2 I_d + J_f^T J_f S)^{-1} J_f^T r``,
+    eliminating the observation-space nullspace ``ker(J_f^T)`` before GMRES.
     """
     if not isinstance(current, torch.Tensor) or not isinstance(clean, torch.Tensor):
         raise ValueError("current and clean must be tensors")
@@ -190,6 +201,8 @@ def mmps_guidance(
         raise ValueError("MMPS expects real floating-point tensors")
     if not isinstance(maxiter, int) or isinstance(maxiter, bool) or maxiter < 1:
         raise ValueError("maxiter must be a positive integer")
+    if solver_space not in ("auto", "observation", "latent"):
+        raise ValueError("solver_space must be one of: auto, observation, latent")
 
     sigma_value = _as_scalar_float("sigma", sigma)
     if sigma_value <= 0:
@@ -210,6 +223,9 @@ def mmps_guidance(
     _require_finite("measured observation", measured)
     rhs = observation - measured
     work_dtype = torch.float64 if rhs.dtype == torch.float64 else torch.float32
+    resolved_space = (
+        "latent" if observation.numel() > clean.numel() else "observation"
+    ) if solver_space == "auto" else solver_space
 
     def latent_vjp(tangent):
         tangent = tangent.to(dtype=clean.dtype)
@@ -243,39 +259,59 @@ def mmps_guidance(
                 return torch.zeros_like(dual_output)
             return result
 
-    def covariance_measurement_product(vector):
-        latent_vector = measurement_vjp(vector)
-        propagated = covariance_scale * latent_vjp(latent_vector)
-        return measurement_jvp(propagated)
-
     sigma_squared = sigma_value * sigma_value
-
-    def system_product(vector):
-        vector_work = vector.to(dtype=work_dtype)
-        covariance_product = covariance_measurement_product(
-            vector_work.to(dtype=measured.dtype)
-        )
-        return sigma_squared * vector_work + covariance_product.to(dtype=work_dtype)
-
     rhs_work = rhs.detach().to(dtype=work_dtype)
     _require_finite("the MMPS linear-system right-hand side", rhs_work)
-    try:
-        solved, diagnostics = _gmres(system_product, rhs_work, maxiter)
-    except FloatingPointError:
-        raise
-    except RuntimeError as error:
-        raise RuntimeError("MMPS matrix-free derivative or GMRES operation failed") from error
 
-    # The posterior score is J_mu.T A.T v. Gradients are intentionally not
-    # retained, so the sampler applies this as a detached epsilon correction.
-    measurement_cotangent = measurement_vjp(solved.detach())
-    likelihood_score = latent_vjp(measurement_cotangent).detach()
+    if resolved_space == "observation":
+        def system_product(vector):
+            vector_work = vector.to(dtype=work_dtype)
+            latent_vector = measurement_vjp(vector_work.to(dtype=measured.dtype))
+            propagated = covariance_scale * latent_vjp(latent_vector)
+            covariance_product = measurement_jvp(propagated)
+            return sigma_squared * vector_work + covariance_product.to(dtype=work_dtype)
+
+        try:
+            solved, diagnostics = _gmres(
+                system_product, rhs_work, maxiter, verify_residual=verify_residual
+            )
+        except FloatingPointError:
+            raise
+        except RuntimeError as error:
+            raise RuntimeError("MMPS matrix-free derivative or GMRES operation failed") from error
+
+        # The posterior score is J_mu.T J_f.T v. Gradients are intentionally not
+        # retained, so the sampler applies this as a detached epsilon correction.
+        measurement_cotangent = measurement_vjp(solved.detach())
+        likelihood_score = latent_vjp(measurement_cotangent).detach()
+    else:
+        def latent_system_product(vector):
+            vector_work = vector.to(dtype=work_dtype)
+            propagated = covariance_scale * latent_vjp(vector_work.to(dtype=clean.dtype))
+            meas_tangent = measurement_jvp(propagated)
+            back_latent = measurement_vjp(meas_tangent)
+            return sigma_squared * vector_work + back_latent.to(dtype=work_dtype)
+
+        try:
+            latent_rhs = measurement_vjp(rhs.detach()).detach().to(dtype=work_dtype)
+            _require_finite("the latent-space MMPS right-hand side", latent_rhs)
+            solved_latent, diagnostics = _gmres(
+                latent_system_product, latent_rhs, maxiter, verify_residual=verify_residual
+            )
+        except FloatingPointError:
+            raise
+        except RuntimeError as error:
+            raise RuntimeError("MMPS matrix-free derivative or GMRES operation failed") from error
+
+        likelihood_score = latent_vjp(solved_latent.detach()).detach()
+
     _require_finite("the MMPS likelihood score", likelihood_score)
     diagnostics.update(
         {
             "measurement_rmse": float(torch.mean(rhs_work.square()).sqrt().item()),
             "sigma": float(sigma_value),
             "alpha_bar": float(alpha_value),
+            "solver_space": resolved_space,
         }
     )
     return likelihood_score, diagnostics

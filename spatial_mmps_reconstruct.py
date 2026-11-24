@@ -11,12 +11,13 @@ from time import perf_counter
 
 import numpy as np
 import torch
+from diffusers import DDIMScheduler, DDPMScheduler
 
 from model.ViTDecoder import ViTDecoder
 from spatial import check_provenance, load_autoencoder, load_checkpoint, positive_int, save_json
 from spatial_baselines import interpolate
 from spatial_data import TemperatureData
-from spatial_dps import diffusion_scheduler, FIELD_SHAPE
+from spatial_dps import FIELD_SHAPE
 from spatial_eval import _gradient_metrics, _ssim, _sync
 from spatial_mmps_observation import SpatialObservation
 from spatial_mmps_sampler import sample_mmps
@@ -39,6 +40,21 @@ REQUIRED_METRIC_KEYS = frozenset({
         for kind, unit in (("mae", "_k"), ("rmse", "_k"), ("iou", ""), ("dice", ""))
     ),
 })
+
+
+def build_scheduler(train_steps: int, *, sampler: str = "ddpm", clip_sample: bool = True):
+    """Build an epsilon-prediction DDPM or DDIM scheduler with explicit clipping."""
+    kwargs = dict(
+        num_train_timesteps=train_steps,
+        prediction_type="epsilon",
+        clip_sample=clip_sample,
+        timestep_spacing="linspace",
+    )
+    if sampler == "ddpm":
+        return DDPMScheduler(**kwargs)
+    if sampler == "ddim":
+        return DDIMScheduler(**kwargs)
+    raise ValueError(f"sampler must be 'ddpm' or 'ddim', got {sampler!r}")
 
 
 def parse_device(value: str) -> str:
@@ -137,6 +153,12 @@ def _load_resume_rows(
         "sigma_k",
         "warm_strength",
         "seed",
+        "sampler",
+        "ddim_eta",
+        "clip_sample",
+        "solver_space",
+        "guidance_max_timestep",
+        "score_clip",
     )
     for key in check_keys:
         if existing.get(key) != expected_settings.get(key):
@@ -219,6 +241,30 @@ class TemperatureReconstructor:
         if args.task == "sensors" and self.strength:
             raise ValueError("Eight-sensor reconstruction starts from noise. Use --warm-strength 0.")
 
+        self.sampler = getattr(args, "sampler", "ddpm")
+        if self.sampler not in ("ddpm", "ddim"):
+            raise ValueError("--sampler must be 'ddpm' or 'ddim'")
+        self.ddim_eta = float(getattr(args, "ddim_eta", 0.0)) if self.sampler == "ddim" else None
+        if self.ddim_eta is not None and (not isfinite(self.ddim_eta) or not 0.0 <= self.ddim_eta <= 1.0):
+            raise ValueError("--ddim-eta must be finite and in [0, 1]")
+        self.clip_sample = not bool(getattr(args, "no_clip_sample", False))
+        self.solver_space = getattr(args, "solver_space", "auto")
+        if self.solver_space not in ("auto", "observation", "latent"):
+            raise ValueError("--solver-space must be one of: auto, observation, latent")
+        self.guidance_max_timestep = getattr(args, "guidance_max_timestep", None)
+        if self.guidance_max_timestep is not None:
+            if (
+                not isinstance(self.guidance_max_timestep, int)
+                or isinstance(self.guidance_max_timestep, bool)
+                or not 0 <= self.guidance_max_timestep < self.diffusion_steps
+            ):
+                raise ValueError("--guidance-max-timestep must be in [0, diffusion_steps - 1]")
+        self.score_clip = getattr(args, "score_clip", None)
+        if self.score_clip is not None:
+            self.score_clip = float(self.score_clip)
+            if not isfinite(self.score_clip) or self.score_clip <= 0:
+                raise ValueError("--score-clip must be finite and strictly positive")
+
     def settings(self):
         result = {
             "task": self.operator.task,
@@ -230,6 +276,12 @@ class TemperatureReconstructor:
             "sigma_k": self.sigma_k,
             "warm_strength": self.strength,
             "seed": self.seed,
+            "sampler": self.sampler,
+            "ddim_eta": self.ddim_eta,
+            "clip_sample": self.clip_sample,
+            "solver_space": self.solver_space,
+            "guidance_max_timestep": self.guidance_max_timestep,
+            "score_clip": self.score_clip,
         }
         if self.operator.task == "sensors":
             result["sensor_coordinates_xy"] = self.operator.sensor_coords_xy
@@ -268,18 +320,27 @@ class TemperatureReconstructor:
                 }
 
         diagnostics = []
-        scheduler = diffusion_scheduler(self.diffusion_steps)
+        scheduler = build_scheduler(
+            self.diffusion_steps,
+            sampler=self.sampler,
+            clip_sample=self.clip_sample,
+        )
         raw_normalized = sample_mmps(
             self.prior, self.autoencoder.decoder, measure, measured,
             scheduler=scheduler, steps=self.steps, sigma=self.sigma_k / self.span,
             maxiter=self.maxiter, generator=torch.Generator(device=self.device).manual_seed(seed),
+            solver_space=self.solver_space,
+            guidance_max_timestep=self.guidance_max_timestep,
+            score_clip=self.score_clip,
+            eta=self.ddim_eta,
             diagnostics=diagnostics.append, **initial,
         )
         raw = raw_normalized * self.span + self.low
         projected = self.operator.project(raw, observation)
         self.operator.validate_field(projected, finite=True)
         steps = [record for record in diagnostics if record["phase"] == "step"]
-        residuals = [step["relative_residual"] for step in steps]
+        guided_steps = [step for step in steps if step.get("guided", True)]
+        residuals = [step["relative_residual"] for step in guided_steps]
         clean_oob = [
             step["clean_out_of_unit_box_fraction"]
             for step in steps
@@ -292,14 +353,19 @@ class TemperatureReconstructor:
         ]
         score_ratios = [
             step["score_to_noise_norm_ratio"]
-            for step in steps
+            for step in guided_steps
             if "score_to_noise_norm_ratio" in step
         ]
+        resolved_spaces = sorted({
+            step["solver_space"] for step in guided_steps if "solver_space" in step
+        })
         return projected, raw, {
             "observation_rmse_k_before_projection": self.observation_rmse(raw, observation),
             "observation_rmse_k_after_projection": self.observation_rmse(projected, observation),
-            "solver_steps": len(steps),
-            "solver_converged_steps": sum(bool(step["converged"]) for step in steps),
+            "total_diffusion_steps": len(steps),
+            "solver_steps": len(guided_steps),
+            "solver_converged_steps": sum(bool(step["converged"]) for step in guided_steps),
+            "solver_space_used": resolved_spaces[0] if len(resolved_spaces) == 1 else resolved_spaces,
             "solver_median_relative_residual": median(residuals) if residuals else None,
             "solver_max_relative_residual": max(residuals) if residuals else None,
             "max_clean_out_of_unit_box_fraction": max(clean_oob) if clean_oob else None,
@@ -451,10 +517,14 @@ def evaluate(args):
     settings = model.settings()
     checkpoint_sha256 = _file_sha256(args.checkpoint)
     dataset, samples = validation_panel(data, temperature_range)
-    by_case = {}
-    for index, sample in enumerate(samples):
-        by_case.setdefault(sample["case"], []).append(index)
-    selected_indices = [group[len(group) // 2] for group in by_case.values()][:args.limit]
+    panel_mode = str(getattr(args, "panel", "9"))
+    if panel_mode == "45":
+        selected_indices = list(range(len(samples)))[:args.limit]
+    else:
+        by_case = {}
+        for index, sample in enumerate(samples):
+            by_case.setdefault(sample["case"], []).append(index)
+        selected_indices = [group[len(group) // 2] for group in by_case.values()][:args.limit]
     target_keys = {_row_key(samples[index], args.seed + index) for index in selected_indices}
     resumed_rows = (
         _load_resume_rows(
@@ -541,9 +611,10 @@ def main():
     inference = commands.add_parser("reconstruct", help="Reconstruct one field from a Kelvin .npy observation")
     inference.add_argument("--observation", type=Path, required=True)
     inference.set_defaults(run=reconstruct)
-    evaluation = commands.add_parser("evaluate", help="Measure accuracy on one validation frame per case")
+    evaluation = commands.add_parser("evaluate", help="Measure accuracy on validation frames")
     evaluation.add_argument("--data", type=Path, required=True)
-    evaluation.add_argument("--limit", type=positive_int, help="Maximum number of cases to evaluate")
+    evaluation.add_argument("--panel", choices=("9", "45"), default="9", help="Validation panel size (9=1/case, 45=all slices)")
+    evaluation.add_argument("--limit", type=positive_int, help="Maximum number of frames to evaluate")
     evaluation.add_argument("--resume", action="store_true", help="Resume from an existing compatible output JSON")
     evaluation.set_defaults(run=evaluate)
 
@@ -557,6 +628,12 @@ def main():
         command.add_argument("--sigma-k", type=float, help="MMPS likelihood regularization scale in Kelvin")
         command.add_argument("--maxiter", type=positive_int, default=8, help="GMRES iterations per step")
         command.add_argument("--warm-strength", type=float, help="Fraction of the schedule to use. Set 0 for noise start.")
+        command.add_argument("--sampler", choices=("ddpm", "ddim"), default="ddpm", help="Reverse diffusion scheduler")
+        command.add_argument("--ddim-eta", type=float, default=0.0, help="Stochasticity eta for --sampler ddim (0=deterministic)")
+        command.add_argument("--no-clip-sample", action="store_true", help="Disable scheduler clip_sample to [-1, 1]")
+        command.add_argument("--solver-space", choices=("auto", "observation", "latent"), default="auto", help="GMRES linear system space")
+        command.add_argument("--guidance-max-timestep", type=int, help="Skip MMPS guidance for timesteps above this value")
+        command.add_argument("--score-clip", type=float, help="Cap ||sqrt(1-alpha_bar)*score|| / ||predicted_noise||")
 
     args = parser.parse_args()
     if args.output.resolve() == args.checkpoint.resolve():

@@ -6,6 +6,7 @@ maps a decoded field to its measurements (eight sensors, known inpainting
 pixels, or block-averaged low-resolution pixels).
 """
 
+import inspect
 from math import ceil, isfinite
 
 import torch
@@ -64,6 +65,10 @@ def sample_mmps(
     seed=None,
     initial_latent=None,
     strength=None,
+    solver_space="auto",
+    guidance_max_timestep=None,
+    score_clip=None,
+    eta=None,
     diagnostics=None,
 ):
     """Sample one field using MMPS guidance in the learned latent space.
@@ -127,6 +132,29 @@ def sample_mmps(
             raise ValueError("seed must be an integer")
         if generator is not None:
             raise ValueError("Provide either seed or generator, not both")
+    if solver_space not in ("auto", "observation", "latent"):
+        raise ValueError("solver_space must be one of: auto, observation, latent")
+    if guidance_max_timestep is not None:
+        if (
+            not isinstance(guidance_max_timestep, int)
+            or isinstance(guidance_max_timestep, bool)
+            or guidance_max_timestep < 0
+        ):
+            raise ValueError("guidance_max_timestep must be a non-negative integer")
+    if score_clip is not None:
+        try:
+            score_clip = float(score_clip)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("score_clip must be finite and strictly positive") from None
+        if not isfinite(score_clip) or score_clip <= 0:
+            raise ValueError("score_clip must be finite and strictly positive")
+    if eta is not None:
+        try:
+            eta = float(eta)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("eta must be finite and in [0, 1]") from None
+        if not isfinite(eta) or not 0.0 <= eta <= 1.0:
+            raise ValueError("eta must be finite and in [0, 1]")
 
     if torch.is_inference_mode_enabled():
         raise RuntimeError("MMPS needs autograd; use torch.no_grad rather than inference_mode")
@@ -207,6 +235,8 @@ def sample_mmps(
     def measure_clean(clean_latent):
         return measure(decoder(clean_latent))
 
+    step_supports_eta = "eta" in inspect.signature(scheduler.step).parameters
+
     # The custom transformer uses MultiheadAttention. Disabling the fused
     # fastpath keeps the repeated forward/JVP path available on CPU and CUDA.
     previous_mha_fastpath = torch.backends.mha.get_fastpath_enabled()
@@ -216,32 +246,68 @@ def sample_mmps(
             time_batch = torch.full(
                 (batch_size, 1), timestep, device=device, dtype=torch.long
             )
-            with torch.enable_grad():
-                current = latent.detach().requires_grad_(True)
-                predicted_noise = model(current, None, time_batch)
-                if not isinstance(predicted_noise, torch.Tensor):
-                    raise TypeError("denoiser must return an epsilon tensor")
-                if predicted_noise.shape != current.shape:
-                    raise ValueError("denoiser output shape must match the latent shape")
-                alpha_bar = alpha_schedule[timestep]
-                clean = (current - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
-                score, solver = mmps_guidance(
-                    current,
-                    clean,
-                    observation,
-                    measure_clean,
-                    alpha_bar,
-                    sigma=sigma,
-                    maxiter=maxiter,
-                )
+            alpha_bar = alpha_schedule[timestep]
+            guided = guidance_max_timestep is None or int(timestep) <= guidance_max_timestep
+
+            if guided:
+                with torch.enable_grad():
+                    current = latent.detach().requires_grad_(True)
+                    predicted_noise = model(current, None, time_batch)
+                    if not isinstance(predicted_noise, torch.Tensor):
+                        raise TypeError("denoiser must return an epsilon tensor")
+                    if predicted_noise.shape != current.shape:
+                        raise ValueError("denoiser output shape must match the latent shape")
+                    clean = (current - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
+                    score, solver = mmps_guidance(
+                        current,
+                        clean,
+                        observation,
+                        measure_clean,
+                        alpha_bar,
+                        sigma=sigma,
+                        maxiter=maxiter,
+                        solver_space=solver_space,
+                    )
+            else:
+                with torch.no_grad():
+                    current = latent.detach()
+                    predicted_noise = model(current, None, time_batch)
+                    if not isinstance(predicted_noise, torch.Tensor):
+                        raise TypeError("denoiser must return an epsilon tensor")
+                    if predicted_noise.shape != current.shape:
+                        raise ValueError("denoiser output shape must match the latent shape")
+                    clean = (current - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
+                    score = torch.zeros_like(predicted_noise)
+                    solver = {
+                        "relative_residual": 0.0,
+                        "iterations": 0.0,
+                        "converged": 1.0,
+                        "breakdown": 0.0,
+                        "measurement_rmse": None,
+                        "sigma": float(sigma),
+                        "alpha_bar": float(alpha_bar.item()),
+                        "solver_space": "unconditional",
+                    }
 
             with torch.no_grad():
+                eps_norm = float(torch.linalg.vector_norm(predicted_noise.detach()).item())
+                correction = (1 - alpha_bar).sqrt() * score
+                corr_norm = float(torch.linalg.vector_norm(correction).item())
+                if score_clip is not None and corr_norm > 0.0:
+                    max_corr = score_clip * max(eps_norm, 1e-12)
+                    if corr_norm > max_corr:
+                        score = score * (max_corr / corr_norm)
+                        corr_norm = max_corr
+
                 conditioned_noise = _posterior_noise(predicted_noise, score, alpha_bar)
+                step_kwargs = {"generator": generator}
+                if step_supports_eta and eta is not None:
+                    step_kwargs["eta"] = eta
                 latent = scheduler.step(
                     conditioned_noise,
                     timestep,
                     current,
-                    generator=generator,
+                    **step_kwargs,
                 ).prev_sample
 
                 if diagnostics is not None:
@@ -255,10 +321,6 @@ def sample_mmps(
                         if getattr(scheduler.config, "clip_sample", False)
                         else 0.0
                     )
-                    eps_norm = float(torch.linalg.vector_norm(predicted_noise.detach()).item())
-                    corr_norm = float(
-                        torch.linalg.vector_norm((1 - alpha_bar).sqrt() * score).item()
-                    )
                     score_ratio = corr_norm / max(eps_norm, 1e-12)
 
             total_gmres_iterations += int(solver["iterations"])
@@ -269,6 +331,7 @@ def sample_mmps(
                     "step": step_index,
                     "steps": step_count,
                     "timestep": int(timestep),
+                    "guided": guided,
                     "measurement_dimension": int(observation_dimension),
                     "measurement_rmse": solver["measurement_rmse"],
                     "clean_out_of_unit_box_fraction": clean_oob,

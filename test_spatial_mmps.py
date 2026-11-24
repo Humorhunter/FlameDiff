@@ -29,6 +29,7 @@ from spatial_mmps_reconstruct import (
     _write_json_atomic,
     aggregate_metric_rows,
     build_evaluation_report,
+    build_scheduler,
     evaluate,
     hot_zone_metrics,
     parse_device,
@@ -274,6 +275,93 @@ class TestSampleMMPS(unittest.TestCase):
         self.assertEqual(tuple(out.shape), (1, 1, 48, 64))
         self.assertTrue(torch.isfinite(out).all().item())
 
+    def test_woodbury_latent_space_matches_observation_space_nonsymmetric(self) -> None:
+        gen = torch.Generator().manual_seed(11)
+        d, m = 16, 64
+        a_mat = torch.randn((m, d), generator=gen, dtype=torch.float64)
+        j_mu = torch.randn((d, d), generator=gen, dtype=torch.float64) * 0.25
+        current = torch.randn((1, 1, 4, 4), generator=gen, dtype=torch.float64, requires_grad=True)
+        clean = (current.reshape(1, d) @ j_mu.T).reshape(1, 1, 4, 4)
+        obs = torch.randn((1, m), generator=gen, dtype=torch.float64)
+        measure = lambda z: z.reshape(1, d) @ a_mat.T
+
+        score_obs, diag_obs = mmps_guidance(
+            current, clean, obs, measure, alpha_bar=0.5, sigma=0.3, maxiter=64,
+            solver_space="observation", verify_residual=True,
+        )
+        score_lat, diag_lat = mmps_guidance(
+            current, clean, obs, measure, alpha_bar=0.5, sigma=0.3, maxiter=64,
+            solver_space="latent", verify_residual=False,
+        )
+        score_auto, diag_auto = mmps_guidance(
+            current, clean, obs, measure, alpha_bar=0.5, sigma=0.3, maxiter=64,
+            solver_space="auto",
+        )
+        self.assertEqual(diag_obs["solver_space"], "observation")
+        self.assertEqual(diag_lat["solver_space"], "latent")
+        self.assertEqual(diag_auto["solver_space"], "latent")
+        self.assertLess(float((score_obs - score_lat).abs().max().item()), 1e-11)
+        self.assertTrue(torch.allclose(score_lat, score_auto, atol=1e-12))
+        self.assertEqual(diag_lat["converged"], 1.0)
+        self.assertLess(diag_lat["relative_residual"], 1e-5)
+
+        # When m <= d, auto picks observation space
+        small_obs = torch.randn((1, 8), generator=gen, dtype=torch.float64)
+        _, diag_small = mmps_guidance(
+            current, clean, small_obs, lambda z: z.reshape(1, d)[:, :8],
+            alpha_bar=0.5, sigma=0.3, maxiter=8, solver_space="auto",
+        )
+        self.assertEqual(diag_small["solver_space"], "observation")
+
+    def test_guidance_max_timestep_score_clip_and_ddim(self) -> None:
+        op = SpatialObservation("sensors")
+        obs = torch.linspace(0.1, 0.9, 8).unsqueeze(0)
+        diag: list[dict] = []
+
+        out = sample_mmps(
+            self.denoiser,
+            self.decoder,
+            op.measure,
+            obs,
+            scheduler=build_scheduler(20, sampler="ddim", clip_sample=True),
+            steps=4,
+            sigma=0.05,
+            maxiter=4,
+            seed=9,
+            guidance_max_timestep=10,
+            score_clip=0.05,
+            eta=0.0,
+            diagnostics=diag.append,
+        )
+        self.assertEqual(tuple(out.shape), (1, 1, 192, 256))
+        step_records = [r for r in diag if r["phase"] == "step"]
+        self.assertEqual(len(step_records), 4)
+        self.assertTrue(any(not r["guided"] for r in step_records))
+        self.assertTrue(any(r["guided"] for r in step_records))
+        for rec in step_records:
+            if not rec["guided"]:
+                self.assertEqual(rec["iterations"], 0.0)
+                self.assertEqual(rec["score_to_noise_norm_ratio"], 0.0)
+            else:
+                self.assertLessEqual(rec["score_to_noise_norm_ratio"], 0.05 + 1e-6)
+
+        # Deterministic DDIM (eta=0.0) reproduces identically even with fresh seed
+        out_again = sample_mmps(
+            self.denoiser,
+            self.decoder,
+            op.measure,
+            obs,
+            scheduler=build_scheduler(20, sampler="ddim", clip_sample=True),
+            steps=4,
+            sigma=0.05,
+            maxiter=4,
+            seed=9,
+            guidance_max_timestep=10,
+            score_clip=0.05,
+            eta=0.0,
+        )
+        self.assertTrue(torch.equal(out, out_again))
+
     def test_warm_start_inpaint_and_sr(self) -> None:
         init_latent = torch.zeros((1, 1, 48, 64))
 
@@ -484,6 +572,12 @@ class TestMetricsAndResume(unittest.TestCase):
                 "sigma_k": 65.0,
                 "warm_strength": 0.0,
                 "seed": 0,
+                "sampler": "ddpm",
+                "ddim_eta": None,
+                "clip_sample": True,
+                "solver_space": "auto",
+                "guidance_max_timestep": None,
+                "score_clip": None,
             }
             full_metrics = {key: (None if "1200k" in key or "boundary" in key else 1.0) for key in REQUIRED_METRIC_KEYS}
             sample_row = {
@@ -535,12 +629,19 @@ class TestMetricsAndResume(unittest.TestCase):
                     target_keys={("T1040", "s0", 150, 1)},
                 )
 
-            # Mismatched settings / SHA must raise
+            # Mismatched settings / sampler / SHA must raise
             bad_settings = {**settings, "steps": 50}
             with self.assertRaises(ValueError):
                 _load_resume_rows(
                     out_path,
                     expected_settings=bad_settings,
+                    checkpoint_sha256=ckpt_sha,
+                    epoch=19,
+                )
+            with self.assertRaises(ValueError):
+                _load_resume_rows(
+                    out_path,
+                    expected_settings={**settings, "sampler": "ddim"},
                     checkpoint_sha256=ckpt_sha,
                     epoch=19,
                 )
