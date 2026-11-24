@@ -25,7 +25,30 @@ from spatial_sr_diagnostic import validation_panel
 
 
 TASKS = ("sensors", "inpaint", "sr")
-WARM_DEFAULT = {"sensors": 0.0, "inpaint": 0.25, "sr": 0.1}
+TASK_DEFAULTS = {
+    "sensors": {
+        "steps": 20,
+        "maxiter": 8,
+        "sigma_k": 100.0,
+        "warm_strength": 0.0,
+        "guidance_max_timestep": 500,
+    },
+    "inpaint": {
+        "steps": 20,
+        "maxiter": 16,
+        "sigma_k": 10.0,
+        "warm_strength": 0.0,
+        "guidance_max_timestep": 700,
+    },
+    "sr": {
+        "steps": 50,
+        "maxiter": 16,
+        "sigma_k": 10.0,
+        "warm_strength": 0.1,
+        "guidance_max_timestep": None,
+    },
+}
+WARM_DEFAULT = {task: cfg["warm_strength"] for task, cfg in TASK_DEFAULTS.items()}
 HOT_THRESHOLDS_K = (1000.0, 1200.0)
 REQUIRED_METRIC_KEYS = frozenset({
     "mae_k",
@@ -225,17 +248,16 @@ class TemperatureReconstructor:
         self.prior.load_state_dict(checkpoint["weights"])
         self.autoencoder = load_autoencoder(checkpoint["ae_weights"], self.device)
         self.diffusion_steps = int(checkpoint["diffusion_steps"])
-        self.steps = args.steps
+        defaults = TASK_DEFAULTS[args.task]
+        self.steps = defaults["steps"] if args.steps is None else args.steps
         if not 2 <= self.steps <= self.diffusion_steps:
             raise ValueError("--steps must be between 2 and the checkpoint's diffusion step count")
-        self.maxiter = args.maxiter
+        self.maxiter = defaults["maxiter"] if args.maxiter is None else args.maxiter
         self.seed = args.seed
-        self.sigma_k = args.sigma_k
-        if self.sigma_k is None:
-            self.sigma_k = 0.05 * self.span if args.task == "sensors" else 10.0
+        self.sigma_k = defaults["sigma_k"] if args.sigma_k is None else args.sigma_k
         if not isfinite(self.sigma_k) or self.sigma_k <= 0:
             raise ValueError("--sigma-k must be finite and strictly positive")
-        self.strength = WARM_DEFAULT[args.task] if args.warm_strength is None else args.warm_strength
+        self.strength = defaults["warm_strength"] if args.warm_strength is None else args.warm_strength
         if not isfinite(self.strength) or not 0 <= self.strength <= 1:
             raise ValueError("--warm-strength must be between 0 and 1")
         if args.task == "sensors" and self.strength:
@@ -251,14 +273,20 @@ class TemperatureReconstructor:
         self.solver_space = getattr(args, "solver_space", "auto")
         if self.solver_space not in ("auto", "observation", "latent"):
             raise ValueError("--solver-space must be one of: auto, observation, latent")
-        self.guidance_max_timestep = getattr(args, "guidance_max_timestep", None)
+        raw_gmax = getattr(args, "guidance_max_timestep", None)
+        if raw_gmax is None:
+            self.guidance_max_timestep = defaults["guidance_max_timestep"]
+        elif raw_gmax == -1:
+            self.guidance_max_timestep = None
+        else:
+            self.guidance_max_timestep = raw_gmax
         if self.guidance_max_timestep is not None:
             if (
                 not isinstance(self.guidance_max_timestep, int)
                 or isinstance(self.guidance_max_timestep, bool)
                 or not 0 <= self.guidance_max_timestep < self.diffusion_steps
             ):
-                raise ValueError("--guidance-max-timestep must be in [0, diffusion_steps - 1]")
+                raise ValueError("--guidance-max-timestep must be -1 (disabled) or in [0, diffusion_steps - 1]")
         self.score_clip = getattr(args, "score_clip", None)
         if self.score_clip is not None:
             self.score_clip = float(self.score_clip)
@@ -417,6 +445,7 @@ def build_evaluation_report(
     rows: list[dict],
     status: str,
     peak_cuda_memory_mb: float | None = None,
+    panel_description: str = "middle slice and validation frame of each selected case",
 ) -> dict:
     """Assemble the evaluation JSON payload for incremental or final saves."""
     summary_metrics = aggregate_metric_rows([row["metrics"] for row in rows])
@@ -448,7 +477,7 @@ def build_evaluation_report(
         "checkpoint_sha256": checkpoint_sha256,
         "epoch": epoch,
         "split_name": "val",
-        "panel": "middle slice and validation frame of each selected case",
+        "panel": panel_description,
         "evaluation_region": {
             "sensors": "unmeasured_pixels",
             "inpaint": "missing_rectangle",
@@ -520,11 +549,13 @@ def evaluate(args):
     panel_mode = str(getattr(args, "panel", "9"))
     if panel_mode == "45":
         selected_indices = list(range(len(samples)))[:args.limit]
+        panel_description = "all five slices middle validation frame of each case"
     else:
         by_case = {}
         for index, sample in enumerate(samples):
             by_case.setdefault(sample["case"], []).append(index)
         selected_indices = [group[len(group) // 2] for group in by_case.values()][:args.limit]
+        panel_description = "middle slice and validation frame of each selected case"
     target_keys = {_row_key(samples[index], args.seed + index) for index in selected_indices}
     resumed_rows = (
         _load_resume_rows(
@@ -586,6 +617,7 @@ def evaluate(args):
             rows=rows,
             status="running",
             peak_cuda_memory_mb=_peak_cuda_mb(),
+            panel_description=panel_description,
         )
         _write_json_atomic(args.output, partial)
 
@@ -599,6 +631,7 @@ def evaluate(args):
         rows=rows,
         status="complete",
         peak_cuda_memory_mb=_peak_cuda_mb(),
+        panel_description=panel_description,
     )
     _write_json_atomic(args.output, result)
     print(json.dumps({key: value for key, value in result.items() if key != "per_frame"},
@@ -624,15 +657,15 @@ def main():
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", type=parse_device, default="cpu", help="cpu, cuda, or cuda:<index>")
         command.add_argument("--seed", type=int, default=0)
-        command.add_argument("--steps", type=positive_int, default=20)
-        command.add_argument("--sigma-k", type=float, help="MMPS likelihood regularization scale in Kelvin")
-        command.add_argument("--maxiter", type=positive_int, default=8, help="GMRES iterations per step")
-        command.add_argument("--warm-strength", type=float, help="Fraction of the schedule to use. Set 0 for noise start.")
+        command.add_argument("--steps", type=positive_int, help="Diffusion steps (defaults: 20 for sensors/inpaint, 50 for sr)")
+        command.add_argument("--sigma-k", type=float, help="MMPS likelihood regularization scale in Kelvin (defaults: 100 for sensors, 10 for inpaint/sr)")
+        command.add_argument("--maxiter", type=positive_int, help="GMRES iterations per step (defaults: 8 for sensors, 16 for inpaint/sr)")
+        command.add_argument("--warm-strength", type=float, help="Fraction of the schedule to use (defaults: 0 for sensors/inpaint, 0.1 for sr)")
         command.add_argument("--sampler", choices=("ddpm", "ddim"), default="ddpm", help="Reverse diffusion scheduler")
         command.add_argument("--ddim-eta", type=float, default=0.0, help="Stochasticity eta for --sampler ddim (0=deterministic)")
         command.add_argument("--no-clip-sample", action="store_true", help="Disable scheduler clip_sample to [-1, 1]")
         command.add_argument("--solver-space", choices=("auto", "observation", "latent"), default="auto", help="GMRES linear system space")
-        command.add_argument("--guidance-max-timestep", type=int, help="Skip MMPS guidance for timesteps above this value")
+        command.add_argument("--guidance-max-timestep", type=int, help="Skip MMPS guidance above this timestep (-1 disables default cap; defaults: 500 for sensors, 700 for inpaint, none for sr)")
         command.add_argument("--score-clip", type=float, help="Cap ||sqrt(1-alpha_bar)*score|| / ||predicted_noise||")
 
     args = parser.parse_args()

@@ -61,29 +61,34 @@ pixels for the sensor and inpainting tasks, and restores block averages for
 SR. The console reports observation RMSE before and after that projection
 and the GMRES diagnostics. This assumes exact input measurements.
 
-The default initializations are noise for sensors, harmonic interpolation for
-inpainting, and block-mean-corrected bicubic interpolation for SR. The warm
-initializations use the last 25% and 10% of the diffusion schedule,
-respectively. Use `--warm-strength 0` to start from noise for either task.
-`--sigma-k` controls the MMPS likelihood regularization scale in Kelvin.
-Defaults are 5% of the checkpoint temperature span for sensors and 10 K for
-the other two tasks. These are starting settings for validation. The MMPS
-linear solve uses a finite iteration budget, and convergence is reported.
+The validated task defaults (DDPM scheduler with `clip_sample=True` and
+auto Woodbury latent-space GMRES when observations exceed the 3,072-dim
+latent space) are:
+
+| `--task` | `steps` | `warm_strength` | `sigma_k` | `maxiter` | `guidance_max_timestep` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `sensors` | 20 | 0.0 (noise) | 100 K | 8 | 500 |
+| `inpaint` | 20 | 0.0 (noise) | 10 K | 16 | 700 |
+| `sr` | 50 | 0.1 (bicubic) | 10 K | 16 | none |
+
+All defaults can be overridden via CLI flags (pass `--guidance-max-timestep -1`
+to guide every diffusion step).
 
 ```sh
 python spatial_mmps_reconstruct.py evaluate --task inpaint \
   --checkpoint outputs/spatial/prior.pt --data ../H2_Tco_jet_flames_3fields \
-  --output outputs/spatial/mmps-inpaint-val.json --device cuda --resume
+  --panel 45 --output outputs/spatial/mmps-inpaint-val45.json --device cuda --resume
 ```
 
-Evaluation uses the middle slice and middle validation frame of each
-case. It measures errors over unmeasured pixels for sensors, the missing
-rectangle for inpainting, and the full field for SR, reporting both raw
-and projected results for MAE, RMSE, gradient MAE (plus boundary gradient
-MAE for inpainting), SSIM, hot-zone MAE/RMSE/IoU/Dice at 1000 K and
-1200 K, observation RMSE, and GMRES diagnostics. Progress is written
-atomically after each frame (`status: "running"` until `"complete"`), and
-`--resume` skips already-completed compatible frames.
+Evaluation defaults to `--panel 9` (middle slice and validation frame per
+case) and supports `--panel 45` (all five slices per case). It measures
+errors over unmeasured pixels for sensors, the missing rectangle for
+inpainting, and the full field for SR, reporting both raw and projected
+results for MAE, RMSE, gradient MAE (plus boundary gradient MAE for
+inpainting), SSIM, hot-zone MAE/RMSE/IoU/Dice at 1000 K and 1200 K,
+observation RMSE, saturation diagnostics, and GMRES statistics. Progress
+is written atomically after each frame (`status: "running"` until
+`"complete"`), and `--resume` skips already-completed compatible frames.
 
 ### DPS and spatial benchmark
 

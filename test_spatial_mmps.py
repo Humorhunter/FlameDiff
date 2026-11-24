@@ -22,6 +22,7 @@ from spatial_mmps import mmps_guidance
 from spatial_mmps_observation import DEFAULT_SENSOR_COORDS_XY, SpatialObservation
 from spatial_mmps_reconstruct import (
     REQUIRED_METRIC_KEYS,
+    TASK_DEFAULTS,
     TemperatureReconstructor,
     _file_sha256,
     _load_resume_rows,
@@ -563,6 +564,44 @@ class TestMetricsAndResume(unittest.TestCase):
         for invalid in ("mps", "cuda:-1", "cuda:abc", "gpu", "cuda:"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 parse_device(invalid)
+
+    def test_task_defaults_and_disable_guidance_cap(self) -> None:
+        self.assertEqual(TASK_DEFAULTS["sensors"]["guidance_max_timestep"], 500)
+        self.assertEqual(TASK_DEFAULTS["sensors"]["sigma_k"], 100.0)
+        self.assertEqual(TASK_DEFAULTS["inpaint"]["warm_strength"], 0.0)
+        self.assertEqual(TASK_DEFAULTS["inpaint"]["maxiter"], 16)
+        self.assertEqual(TASK_DEFAULTS["inpaint"]["guidance_max_timestep"], 700)
+        self.assertEqual(TASK_DEFAULTS["sr"]["steps"], 50)
+        self.assertEqual(TASK_DEFAULTS["sr"]["maxiter"], 16)
+
+        tiny_prior = ViTDecoder(d_model=16, num_heads=4, num_layers=1, num_feats=0)
+        fake_ckpt = {
+            "model_config": {"d_model": 16, "num_heads": 4, "num_layers": 1, "num_feats": 0},
+            "temperature_range": [300.0, 1600.0],
+            "weights": tiny_prior.state_dict(),
+            "ae_weights": {},
+            "diffusion_steps": 1000,
+        }
+        with patch("spatial_mmps_reconstruct.load_autoencoder", return_value=nn.Identity()):
+            # Default sensors picks validated defaults
+            args_default = SimpleNamespace(
+                task="sensors", device="cpu", seed=0, steps=None, maxiter=None,
+                sigma_k=None, warm_strength=None, guidance_max_timestep=None,
+            )
+            rec = TemperatureReconstructor(args_default, fake_ckpt)
+            self.assertEqual(rec.steps, 20)
+            self.assertEqual(rec.maxiter, 8)
+            self.assertEqual(rec.sigma_k, 100.0)
+            self.assertEqual(rec.strength, 0.0)
+            self.assertEqual(rec.guidance_max_timestep, 500)
+
+            # Passing guidance_max_timestep=-1 explicitly disables the default cap
+            args_uncapped = SimpleNamespace(
+                task="sensors", device="cpu", seed=0, steps=None, maxiter=None,
+                sigma_k=None, warm_strength=None, guidance_max_timestep=-1,
+            )
+            rec_uncapped = TemperatureReconstructor(args_uncapped, fake_ckpt)
+            self.assertIsNone(rec_uncapped.guidance_max_timestep)
 
     def test_aggregate_and_resume_compatibility(self) -> None:
         # Union of keys across rows must preserve keys appearing only in later rows
