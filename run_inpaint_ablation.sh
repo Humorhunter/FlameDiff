@@ -33,9 +33,9 @@ for variant in conv transformer; do
         architecture+=(--attention-blocks 2)
     fi
     "$python" -u spatial_inpaint_experiment.py train "${train_args[@]}" "${architecture[@]}" \
-        --width 32 --epochs 20 --batch-size 4 --save-epochs 10 20 --output "$out/$variant.pt" \
+        --width 32 --epochs 30 --batch-size 4 --save-epochs 10 20 30 --output "$out/$variant.pt" \
         2>&1 | tee "$out/$variant-train.log"
-    for epoch in 0010 0020; do
+    for epoch in 0010 0020 0030; do
         "$python" -u spatial_inpaint_experiment.py benchmark "${eval_args[@]}" \
             --checkpoint "$out/$variant-epoch-$epoch.pt" --steps 50 --draws 4 \
             --output "$out/$variant-epoch-$epoch-val45.json" \

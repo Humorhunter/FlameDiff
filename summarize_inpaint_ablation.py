@@ -41,15 +41,17 @@ def improves(delta):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
-    directory = parser.parse_args().directory
+    parser.add_argument("--epochs", type=int, nargs="+", default=[10, 20, 30])
+    args = parser.parse_args()
+    directory = args.directory
     reports = {}
     for variant in ("conv", "transformer"):
-        for epoch in (10, 20):
+        for epoch in args.epochs:
             path = directory / f"{variant}-epoch-{epoch:04d}-val45.json"
             reports[variant, epoch] = json.loads(path.read_text())
 
     pairings = []
-    for epoch in (10, 20):
+    for epoch in args.epochs:
         conv, transformer = (reports[variant, epoch] for variant in ("conv", "transformer"))
         if any(conv[key] != transformer[key] for key in ("samples", "split", "sampling", "seed")):
             raise ValueError("Unmatched validation reports")
