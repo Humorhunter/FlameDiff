@@ -68,10 +68,30 @@ def prepare(device_name, seed):
     return torch.device(device_name)
 
 
-def load_autoencoder(weights, device):
-    model = AutoEnDecoder()
+def load_autoencoder(weights, device, ae_config=None):
+    if ae_config is None:
+        inferred_channels = 1
+        if isinstance(weights, dict) and "encoder.proj2.bias" in weights:
+            inferred_channels = int(weights["encoder.proj2.bias"].shape[0])
+        ae_config = {"latent_channels": inferred_channels, "output_activation": "relu"}
+    model = AutoEnDecoder(
+        latent_channels=int(ae_config.get("latent_channels", 1)),
+        output_activation=str(ae_config.get("output_activation", "relu")),
+    )
     model.load_state_dict(weights)
     return model.to(device).eval().requires_grad_(False)
+
+
+def _gradient_l1_loss(prediction, target):
+    dy = functional.l1_loss(
+        prediction[..., 1:, :] - prediction[..., :-1, :],
+        target[..., 1:, :] - target[..., :-1, :],
+    )
+    dx = functional.l1_loss(
+        prediction[..., :, 1:] - prediction[..., :, :-1],
+        target[..., :, 1:] - target[..., :, :-1],
+    )
+    return 0.5 * (dy + dx)
 
 
 def subset(data, limit):
@@ -104,25 +124,44 @@ def train(args):
     }
 
     if args.stage == "ae":
-        model = AutoEnDecoder().to(device)
+        ae_config = {
+            "latent_channels": args.latent_channels,
+            "output_activation": args.ae_output_activation,
+        }
+        grad_weight = float(args.ae_grad_weight)
+        if not isfinite(grad_weight) or grad_weight < 0:
+            raise ValueError("--ae-grad-weight must be finite and non-negative")
+        model = AutoEnDecoder(**ae_config).to(device)
         torch.nn.init.zeros_(model.decoder.conv8.weight)
         torch.nn.init.constant_(model.decoder.conv8.bias, 0.5)
+        metadata.update(ae_config=ae_config, ae_grad_weight=grad_weight)
 
         def loss(target, generator=None):
-            return functional.mse_loss(model(target), target)
+            prediction = model(target)
+            value = functional.mse_loss(prediction, target)
+            if grad_weight > 0.0:
+                value = value + grad_weight * _gradient_l1_loss(prediction, target)
+            return value
 
     elif args.stage == "prior":
         if args.width % 8:
             raise ValueError("Denoiser width must be a multiple of eight")
         pretrained = load_checkpoint(args.ae_checkpoint, "ae")
         check_provenance(pretrained, data, temperature_range)
-        autoencoder = load_autoencoder(pretrained["weights"], device)
+        ae_config = pretrained.get("ae_config")
+        if ae_config is None:
+            inferred_channels = int(pretrained["weights"]["encoder.proj2.bias"].shape[0])
+            ae_config = {"latent_channels": inferred_channels, "output_activation": "relu"}
+        autoencoder = load_autoencoder(pretrained["weights"], device, ae_config=ae_config)
         model_config = {"d_model": args.width, "num_layers": args.layers, "num_feats": 0}
+        if autoencoder.latent_channels != 1:
+            model_config["in_channels"] = autoencoder.latent_channels
         model = ViTDecoder(**model_config).to(device)
         scheduler = diffusion_scheduler(args.diffusion_steps)
         metadata.update(
             model_config=model_config,
             diffusion_steps=args.diffusion_steps,
+            ae_config=ae_config,
             ae_weights=pretrained["weights"],
             ae_train_count=pretrained["train_count"],
         )
@@ -181,7 +220,19 @@ def train(args):
         validation_loss /= len(val_data)
         if not isfinite(validation_loss):
             raise ValueError("Non-finite validation loss")
-        print(f"epoch {epoch}: train={train_loss / len(train_data):.6g} val={validation_loss:.6g}")
+        if args.stage == "ae":
+            span = temperature_range[1] - temperature_range[0]
+            val_rmse_k = (validation_loss ** 0.5) * span
+            print(
+                f"epoch {epoch}: train={train_loss / len(train_data):.6g} "
+                f"val_mse={validation_loss:.6g} val_rmse_k={val_rmse_k:.2f} K",
+                flush=True,
+            )
+        else:
+            print(
+                f"epoch {epoch}: train={train_loss / len(train_data):.6g} val={validation_loss:.6g}",
+                flush=True,
+            )
         is_best = validation_loss < best
         if is_best or epoch in checkpoint_epochs:
             checkpoint = {
@@ -206,7 +257,9 @@ def make_predictor(args, operator, device, checkpoint, *, initializer=None, stre
         model = ViTDecoder(**checkpoint["model_config"]).to(device)
         model.load_state_dict(checkpoint["weights"])
         model.eval().requires_grad_(False)
-        autoencoder = load_autoencoder(checkpoint["ae_weights"], device)
+        autoencoder = load_autoencoder(
+            checkpoint["ae_weights"], device, ae_config=checkpoint.get("ae_config")
+        )
         scheduler = diffusion_scheduler(checkpoint["diffusion_steps"])
         generator = torch.Generator(device=device).manual_seed(args.seed)
         guidance = args.guidance if args.method == "dps" else float(args.method == "mmps")
@@ -266,7 +319,9 @@ def benchmark(args):
     if checkpoint:
         check_provenance(checkpoint, data, temperature_range)
     if args.method == "ae":
-        model = load_autoencoder(checkpoint["weights"], device)
+        model = load_autoencoder(
+            checkpoint["weights"], device, ae_config=checkpoint.get("ae_config")
+        )
         with torch.no_grad():
             errors = [(model(frame[None].to(device)).cpu() - frame[None]).square().mean().item()
                       for frame in subset(dataset, args.limit)]
@@ -346,6 +401,12 @@ def main():
     training.add_argument("--batch-size", default=4, type=positive_int)
     training.add_argument("--workers", default=0, type=int)
     training.add_argument("--learning-rate", type=float)
+    training.add_argument("--latent-channels", default=1, type=positive_int,
+                          help="Autoencoder latent channel count (default 1)")
+    training.add_argument("--ae-output-activation", choices=("relu", "linear"), default="relu",
+                          help="Autoencoder decoder output activation (linear removes dead-ReLU zones)")
+    training.add_argument("--ae-grad-weight", default=0.0, type=float,
+                          help="Optional finite-difference gradient L1 weight for AE training")
     training.add_argument("--ae-checkpoint", type=Path)
     training.add_argument("--width", default=256, type=positive_int)
     training.add_argument("--layers", default=8, type=positive_int)

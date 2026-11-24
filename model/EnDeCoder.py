@@ -3,12 +3,15 @@ from torch import nn
 from torch.nn import functional as F
 
 class AutoEncoder(nn.Module):
-    def __init__(self,):
+    def __init__(self, latent_channels: int = 1):
         '''
-        AutoEncoder model, downsample (1, 192, 256) ->(1, 48, 64), modified from famous U-Net model.
+        AutoEncoder model, downsample (1, 192, 256) -> (latent_channels, 48, 64), modified from famous U-Net model.
         https://arxiv.org/pdf/1505.04597
         '''
         super().__init__()
+        if not isinstance(latent_channels, int) or isinstance(latent_channels, bool) or latent_channels < 1:
+            raise ValueError("latent_channels must be a positive integer")
+        self.latent_channels = latent_channels
         self.conv1 = nn.Conv2d(1, 64, 3, padding=1) # (1, 192, 256) -> (64, 192, 256)
         self.conv2 = nn.Conv2d(64, 64, 5, padding=2) # (64, 192, 256) -> (64, 192, 256)
         self.pool1 = nn.MaxPool2d(2, 2) # (64, 192, 256) -> (64, 96, 128)
@@ -16,7 +19,7 @@ class AutoEncoder(nn.Module):
         self.conv4 = nn.Conv2d(128, 128, 5, padding=2) # (128, 96, 128) -> (128, 96, 128)
         self.pool2 = nn.MaxPool2d(2, 2) # (128, 96, 128) -> (128, 48, 64)
         self.proj1 = nn.Linear(128, 64) # (128, 48, 64) -> (64, 48, 64)
-        self.proj2 = nn.Linear(64, 1) # (64, 48, 64) -> (1, 48, 64)
+        self.proj2 = nn.Linear(64, latent_channels) # (64, 48, 64) -> (C, 48, 64)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.selu(self.conv1(x))
@@ -32,13 +35,19 @@ class AutoEncoder(nn.Module):
         return x
 
 class AutoDecoder(nn.Module):
-    def __init__(self,):
+    def __init__(self, latent_channels: int = 1, output_activation: str = "relu"):
         '''
-        AutoDecoder model, upsample (1, 48, 64) -> (1, 192, 256), modified from famous U-Net model.
+        AutoDecoder model, upsample (latent_channels, 48, 64) -> (1, 192, 256), modified from famous U-Net model.
         https://arxiv.org/pdf/1505.04597
         '''
         super().__init__()
-        self.proj1 = nn.Linear(1, 64) # (1, 48, 64) -> (64, 48, 64)
+        if not isinstance(latent_channels, int) or isinstance(latent_channels, bool) or latent_channels < 1:
+            raise ValueError("latent_channels must be a positive integer")
+        if output_activation not in ("relu", "linear"):
+            raise ValueError("output_activation must be 'relu' or 'linear'")
+        self.latent_channels = latent_channels
+        self.output_activation = output_activation
+        self.proj1 = nn.Linear(latent_channels, 64) # (C, 48, 64) -> (64, 48, 64)
         self.proj2 = nn.Linear(64, 128)  # (64, 48, 64) -> (128, 48, 64)
         self.conv5 = nn.Conv2d(128, 128, 5, padding=2) # (128, 96, 128) -> (128, 96, 128)
         self.conv6 = nn.Conv2d(128, 64, 3, padding=1) # (128, 96, 128) -> (64, 96, 128)
@@ -49,24 +58,33 @@ class AutoDecoder(nn.Module):
         x = x.permute(0, 2, 3, 1)
         x = F.selu(self.proj1(x) )
         x = F.selu(self.proj2(x))
-        x = x.permute(0, 3, 1, 2) # (1, 48, 64) -> (128, 48, 64)
+        x = x.permute(0, 3, 1, 2) # (C, 48, 64) -> (128, 48, 64)
         x = F.interpolate(x, scale_factor=2) # (128, 48, 64) -> (128, 96, 128)
         x = F.selu(self.conv5(x))
         x = F.selu(self.conv6(x))
         x = F.interpolate(x, scale_factor=2) # (128, 96, 128) -> (128, 192, 256)
-        x = F.relu(self.conv7(x))
-        x = F.relu(self.conv8(x))
+        if self.output_activation == "linear":
+            x = F.silu(self.conv7(x))
+            x = self.conv8(x)
+        else:
+            x = F.relu(self.conv7(x))
+            x = F.relu(self.conv8(x))
         return x
     
 class AutoEnDecoder(nn.Module):
-    def __init__(self,):
+    def __init__(self, latent_channels: int = 1, output_activation: str = "relu"):
         '''
-        AutoEncoderDecoder model, downsample (1, 192, 256) ->(1, 24, 32) -> upsample (1, 192, 256), modified from famous U-Net model.
+        AutoEncoderDecoder model, downsample (1, 192, 256) -> (latent_channels, 48, 64) -> upsample (1, 192, 256).
         https://arxiv.org/pdf/1505.04597
         '''
         super().__init__()
-        self.encoder = AutoEncoder()
-        self.decoder = AutoDecoder()
+        self.latent_channels = latent_channels
+        self.output_activation = output_activation
+        self.encoder = AutoEncoder(latent_channels=latent_channels)
+        self.decoder = AutoDecoder(
+            latent_channels=latent_channels,
+            output_activation=output_activation,
+        )
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x

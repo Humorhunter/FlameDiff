@@ -246,7 +246,9 @@ class TemperatureReconstructor:
         self.operator = SpatialObservation(args.task)
         self.prior = ViTDecoder(**model_config).to(self.device).eval().requires_grad_(False)
         self.prior.load_state_dict(checkpoint["weights"])
-        self.autoencoder = load_autoencoder(checkpoint["ae_weights"], self.device)
+        self.autoencoder = load_autoencoder(
+            checkpoint["ae_weights"], self.device, ae_config=checkpoint.get("ae_config")
+        )
         self.diffusion_steps = int(checkpoint["diffusion_steps"])
         defaults = TASK_DEFAULTS[args.task]
         self.steps = defaults["steps"] if args.steps is None else args.steps
@@ -310,6 +312,8 @@ class TemperatureReconstructor:
             "solver_space": self.solver_space,
             "guidance_max_timestep": self.guidance_max_timestep,
             "score_clip": self.score_clip,
+            "latent_channels": getattr(self.autoencoder, "latent_channels", 1),
+            "ae_output_activation": getattr(self.autoencoder, "output_activation", "relu"),
         }
         if self.operator.task == "sensors":
             result["sensor_coordinates_xy"] = self.operator.sensor_coords_xy
@@ -357,6 +361,7 @@ class TemperatureReconstructor:
             self.prior, self.autoencoder.decoder, measure, measured,
             scheduler=scheduler, steps=self.steps, sigma=self.sigma_k / self.span,
             maxiter=self.maxiter, generator=torch.Generator(device=self.device).manual_seed(seed),
+            latent_channels=getattr(self.autoencoder, "latent_channels", None),
             solver_space=self.solver_space,
             guidance_max_timestep=self.guidance_max_timestep,
             score_clip=self.score_clip,

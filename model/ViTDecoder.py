@@ -14,7 +14,7 @@ def timestep_embedding(timesteps, dim, dtype=torch.float32):
     return emb
 
 class ViTDecoder(nn.Module):
-    def __init__(self, d_model=256, img_size=(48, 64), num_heads=8, num_layers=8, num_feats=8):
+    def __init__(self, d_model=256, img_size=(48, 64), num_heads=8, num_layers=8, num_feats=8, in_channels=1):
         """
         Enhanced Vision Transformer Decoder with U-Net style skip connections.
         
@@ -23,12 +23,17 @@ class ViTDecoder(nn.Module):
             img_size: Tuple representing input image size.
             num_heads: Number of attention heads in the Transformer.
             num_layers: Number of Transformer encoder layers.
+            num_feats: Number of conditional sensor tokens (0 for unconditional).
+            in_channels: Latent channel count (default 1).
         """
         super().__init__()
+        if not isinstance(in_channels, int) or isinstance(in_channels, bool) or in_channels < 1:
+            raise ValueError("in_channels must be a positive integer")
         self.d_model = d_model
+        self.in_channels = in_channels
         
         self.conv1 = nn.Sequential(
-            nn.Conv2d(1, d_model//4, kernel_size=3, stride=1, padding=1),  # (B, 1, 48, 64) -> (B, d_model//4, 48, 64)
+            nn.Conv2d(in_channels, d_model//4, kernel_size=3, stride=1, padding=1),  # (B, C, 48, 64) -> (B, d_model//4, 48, 64)
             nn.SiLU(),
             nn.Conv2d(d_model//4, d_model//4, kernel_size=5, stride=1, padding=2),  # (B, d_model//4, 48, 64) -> (B, d_model//4, 48, 64)
             nn.SiLU(),
@@ -69,7 +74,7 @@ class ViTDecoder(nn.Module):
             nn.SiLU(),
             nn.Conv2d(d_model//2, d_model//4, kernel_size=5, stride=1, padding=2),  # (B, d_model//4, 48, 64) -> (B, d_model//4, 48, 64)
             nn.SiLU(),
-            nn.Conv2d(d_model//4, 1, kernel_size=5, stride=1, padding=2),  # (B, d_model//4, 48, 64) -> (B, 1, 48, 64)
+            nn.Conv2d(d_model//4, in_channels, kernel_size=5, stride=1, padding=2),  # (B, d_model//4, 48, 64) -> (B, C, 48, 64)
             # nn.Tanh()
         )
         

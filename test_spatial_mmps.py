@@ -15,8 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.EnDeCoder import AutoDecoder
+from model.EnDeCoder import AutoDecoder, AutoEnDecoder
 from model.ViTDecoder import ViTDecoder
+from spatial import load_autoencoder
 from spatial_dps import diffusion_scheduler
 from spatial_mmps import mmps_guidance
 from spatial_mmps_observation import DEFAULT_SENSOR_COORDS_XY, SpatialObservation
@@ -381,6 +382,85 @@ class TestSampleMMPS(unittest.TestCase):
         )
         self.assertEqual(tuple(sr_out.shape), (1, 1, 192, 256))
         self.assertTrue(torch.isfinite(sr_out).all().item())
+
+    def test_multichannel_ae_vit_and_mmps_end_to_end(self) -> None:
+        ae4 = AutoEnDecoder(latent_channels=4, output_activation="linear").eval().requires_grad_(False)
+        field = torch.randn((1, 1, 192, 256))
+        with torch.no_grad():
+            z4 = ae4.encoder(field)
+            rec = ae4.decoder(z4)
+        self.assertEqual(tuple(z4.shape), (1, 4, 48, 64))
+        self.assertEqual(tuple(rec.shape), (1, 1, 192, 256))
+
+        # Round-trip load_autoencoder with explicit ae_config and inferred latent_channels
+        loaded_cfg = load_autoencoder(
+            ae4.state_dict(),
+            torch.device("cpu"),
+            ae_config={"latent_channels": 4, "output_activation": "linear"},
+        )
+        self.assertEqual(loaded_cfg.latent_channels, 4)
+        self.assertEqual(loaded_cfg.output_activation, "linear")
+        loaded_inferred = load_autoencoder(ae4.state_dict(), torch.device("cpu"))
+        self.assertEqual(loaded_inferred.latent_channels, 4)
+        self.assertEqual(loaded_inferred.output_activation, "relu")
+
+        # Legacy 1-channel default remains intact
+        ae1 = AutoEnDecoder().eval().requires_grad_(False)
+        loaded1 = load_autoencoder(ae1.state_dict(), torch.device("cpu"))
+        self.assertEqual(loaded1.latent_channels, 1)
+        self.assertEqual(loaded1.output_activation, "relu")
+
+        prior4 = ViTDecoder(
+            d_model=32, num_heads=4, num_layers=1, num_feats=0, in_channels=4
+        ).eval().requires_grad_(False)
+
+        # Mismatched channel count between prior and decoder must fail fast
+        with self.assertRaises(ValueError):
+            sample_mmps(
+                prior4, ae1.decoder, SpatialObservation("sensors").measure,
+                torch.zeros((1, 8)), scheduler=diffusion_scheduler(20), steps=2, maxiter=2,
+            )
+
+        # 4-channel sensors (pure noise) -> auto picks observation space (8 <= 12288)
+        diag_s: list[dict] = []
+        out_s = sample_mmps(
+            prior4, loaded_cfg.decoder, SpatialObservation("sensors").measure,
+            torch.zeros((1, 8)), scheduler=diffusion_scheduler(20), steps=2, maxiter=2,
+            seed=1, diagnostics=diag_s.append,
+        )
+        self.assertEqual(tuple(out_s.shape), (1, 1, 192, 256))
+        self.assertEqual(
+            [r["solver_space"] for r in diag_s if r["phase"] == "step"],
+            ["observation", "observation"],
+        )
+
+        # 4-channel SR (warm start) -> auto picks observation space (3072 <= 12288)
+        diag_sr: list[dict] = []
+        out_sr = sample_mmps(
+            prior4, loaded_cfg.decoder, SpatialObservation("sr").measure,
+            torch.zeros((1, 1, 48, 64)), scheduler=diffusion_scheduler(20), steps=2, maxiter=2,
+            seed=2, initial_latent=z4, strength=0.5, diagnostics=diag_sr.append,
+        )
+        self.assertEqual(tuple(out_sr.shape), (1, 1, 192, 256))
+        self.assertEqual(
+            [r["solver_space"] for r in diag_sr if r["phase"] == "step"],
+            ["observation"],
+        )
+
+        # 4-channel inpaint (warm start) -> auto picks latent space (36864 > 12288)
+        inp_op = SpatialObservation("inpaint")
+        indices = inp_op.mask().flatten().nonzero().flatten()
+        diag_inp: list[dict] = []
+        out_inp = sample_mmps(
+            prior4, loaded_cfg.decoder, lambda f: f.flatten(1).index_select(1, indices),
+            torch.zeros((1, indices.numel())), scheduler=diffusion_scheduler(20), steps=2, maxiter=2,
+            seed=3, initial_latent=z4, strength=0.5, diagnostics=diag_inp.append,
+        )
+        self.assertEqual(tuple(out_inp.shape), (1, 1, 192, 256))
+        self.assertEqual(
+            [r["solver_space"] for r in diag_inp if r["phase"] == "step"],
+            ["latent"],
+        )
 
     def test_warm_start_inpaint_and_sr(self) -> None:
         init_latent = torch.zeros((1, 1, 48, 64))

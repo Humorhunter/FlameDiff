@@ -76,6 +76,7 @@ def sample_mmps(
     seed=None,
     initial_latent=None,
     strength=None,
+    latent_channels=None,
     solver_space="auto",
     guidance_max_timestep=None,
     score_clip=None,
@@ -197,7 +198,28 @@ def sample_mmps(
     if not torch.isfinite(observation).all().item():
         raise ValueError("observation contains non-finite values")
 
-    expected_latent_shape = (batch_size, *LATENT_SHAPE)
+    model_channels = getattr(model, "in_channels", None)
+    decoder_channels = getattr(decoder, "latent_channels", None)
+    if (
+        model_channels is not None
+        and decoder_channels is not None
+        and model_channels != decoder_channels
+    ):
+        raise ValueError(
+            f"denoiser in_channels ({model_channels}) must match decoder latent_channels ({decoder_channels})"
+        )
+    if latent_channels is None:
+        if model_channels is not None:
+            latent_channels = int(model_channels)
+        elif decoder_channels is not None:
+            latent_channels = int(decoder_channels)
+        elif initial_latent is not None and isinstance(initial_latent, torch.Tensor) and initial_latent.ndim == 4:
+            latent_channels = int(initial_latent.shape[1])
+        else:
+            latent_channels = LATENT_SHAPE[0]
+    _validate_positive_int("latent_channels", latent_channels)
+
+    expected_latent_shape = (batch_size, latent_channels, LATENT_SHAPE[1], LATENT_SHAPE[2])
     if initial_latent is not None:
         if not isinstance(initial_latent, torch.Tensor):
             raise ValueError("initial_latent must be a tensor")
