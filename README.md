@@ -90,6 +90,15 @@ observation RMSE, saturation diagnostics, and GMRES statistics. Progress
 is written atomically after each frame (`status: "running"` until
 `"complete"`), and `--resume` skips already-completed compatible frames.
 
+### Benchmark reports and visual comparisons
+
+- **8-sensor comparison vs. converged original FlameDiff (ep54)**:
+  [`reports/8sensor_comparison/README.md`](./reports/8sensor_comparison/README.md) — controlled single-GPU V100S benchmark comparing a fully converged 8-sensor conditional FlameDiff (`ViTDecoder(..., num_feats=8)`, best epoch 54, `val_loss=0.007206`, identical leak-free split and `ae.pt`) against the shared unconditional prior (`e59`) + Latent MMPS:
+  - **45-frame balanced val**: RMSE **`86.79 K`** vs. `95.08 K` (`-8.7%`), raw 8-sensor RMSE **`60.59 K`** vs. `155.98 K` (`2.57×` lower, 45/45 frames won); V100S speed `1.476 s/frame` vs. `0.095 s/frame` (20-step pure-forward).
+  - **9-case held-out test**: RMSE **`92.79 K`** vs. `105.03 K` (20-step orig, `-11.7%`) and `118.02 K` (original default 1000-step, `-21.4%` & **`3.37×` faster** at `1.366 s` vs. `4.606 s/frame`), raw 8-sensor RMSE **`77.04 K`** vs. `185.23–210.78 K` (9/9 cases won).
+- **Three-task MMPS visual gallery & 45-frame benchmark**:
+  [`reports/mmps_visuals/README.md`](./reports/mmps_visuals/README.md) and [`reports/mmps_visuals/val45_benchmark_report.md`](./reports/mmps_visuals/val45_benchmark_report.md).
+
 ### DPS and spatial benchmark
 
 `spatial.py` adds a separate workflow for centered inpainting and 4× spatial
