@@ -31,7 +31,6 @@ from spatial_dps import FIELD_SHAPE, standardize_latent
 from spatial_eval import _gradient_metrics, _ssim, _sync
 from spatial_mmps_observation import SpatialObservation
 from spatial_mmps_sampler import sample_mmps
-from spatial_sr_diagnostic import validation_panel
 
 
 TASKS = ("sensors", "inpaint", "sr")
@@ -342,6 +341,11 @@ def evaluation_panel(data: TemperatureData, split: str, field_ranges):
         {"case": source["case"], "slice": source["slice"], "path": source["path"], "frame": frame}
         for source in sources
     ]
+
+
+def validation_panel(data: TemperatureData, field_ranges):
+    """Balanced validation panel (middle val frame of every case/slice)."""
+    return evaluation_panel(data, "val", field_ranges)
 
 
 def _row_key(sample: dict, seed: int) -> tuple[str, str, int, int]:

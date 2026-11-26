@@ -1,253 +1,86 @@
-# FlameDiff: Flame Field based Diffusion Model
+# FlameDiff — Multi-Field Turbulent Flame Reconstruction & Super-Resolution
 
-As you know, AI can paint:
+Unified latent diffusion framework for single- (`T`) and multi-field (`T, OH, HO2`) turbulent flame reconstruction across **8-sensor sparse reconstruction**, **central inpainting**, **4× spatial super-resolution**, and **zero-retraining cross-field inversion** (e.g., `T-only → T, OH, HO2`).
 
-![AI Paint](./images/gpt_flame.png)
+> **Latest Visual Progress Report**: [`reports/progress_report_20261126.md`](./reports/progress_report_20261126.md)  
+> **Archived ablation/diagnostic scripts**: branch `archive/experiments-20261126`
 
-What if we want AI to paint a real turbulant flame field? This make sense!
+---
 
-![FlameDiff](./images/flame.png)
+## Core Architecture & Code Map
 
-## Running the code
+| File | Role |
+|---|---|
+| `model/EnDeCoder.py` | Legacy CNN AE & Multi-Scale Convolutional AE (`--ae-arch mscae`, parallel `3/5/7` conv + `PixelShuffle`) |
+| `model/LatentUNet.py` | Multi-scale Attention U-Net latent diffusion prior (`--prior-arch unet`) |
+| `model/ViTDecoder.py` | Transformer latent diffusion prior (`--prior-arch vit`) |
+| `spatial_data.py` | Leak-free `train/val/test` + Leave-One-Case-Out (`--holdout-cases`) loader for `T` / `T, OH, HO2` |
+| `spatial.py` | Stage 1 AE/MSCAE training & Stage 2 unconditional prior training (with frozen-latent RAM caching & cosine EMA) |
+| `spatial_mmps.py` / `spatial_mmps_sampler.py` | Matrix-free Woodbury GMRES **Channel-Whitened Adaptive MMPS** & **Adaptive Normalized DPS** |
+| `spatial_mmps_observation.py` | Linear operators (`sensors`, `inpaint`, `sr`) with exact adjoints and channel-selective `--observed-fields` |
+| `spatial_mmps_reconstruct.py` | Unified reconstruction & held-out evaluation CLI (4-draw CRPS, 2D power spectra, noise tests) |
+| `train_eval_3ch_unet.py` | Dedicated 3-field supervised U-Net baselines (`sr`, `inpaint`, Voronoi `sensors`) |
+| `test_spatial_mmps.py` | 26-test unit & mathematical verification suite |
 
-### Prerequisites
+---
 
-Install the required enviroment:
-```
-conda create -f environment.yml
-```
+## Quick Start
 
-### Running the code
-
-The training process is based on `pytorch` and `pytorch-lightning`. All the configurations are stored in the `config` folder and will be arranged by `hydra`.
-
-Before running the training process, modify the `config/default_training.yaml` file to fit your own data path. `cache_path` should be the directory where `T1030` and similar folders are stored. For more information about the parameters in the config, look at the `xxx_training.py` for what parameters are used. Also, you may need to modify the variable `devices` in the training python script to fit your hardware. The experiments are conducted on 8 * 3090 GPUs.
-
-To train the `autoencoder` model, run the following command:
-
-```
-python encoder_training.py exp_name=autoencoder trainer.max_epochs=100
-```
-
-To train the `flame` model, run the following command:
-
-```
-python vit_training.py exp_name=vit trainer.max_epochs=10000
+### 1. Environment
+```bash
+pip install torch numpy scipy "diffusers==0.31.0"
+python -m unittest test_spatial_mmps.py   # 26/26 tests
 ```
 
-## Single-frame spatial benchmark
-
-### Shared latent MMPS reconstruction
-
-Use `spatial_mmps_reconstruct.py` to reconstruct one temperature field
-from eight sensors, a center mask, or a 4× coarse grid. The three tasks
-share the same unconditional spatial prior checkpoint (from
-`spatial.py train prior`) and its embedded autoencoder.
-
-| `--task` | Kelvin `.npy` input |
-| --- | --- |
-| `sensors` | Shape `(8,)` in the `(x, y)` order in `config/default_training.yaml` |
-| `inpaint` | Shape `(192, 256)`. Values at rows `[48, 144)` and columns `[64, 192)` are ignored and may be NaN. |
-| `sr` | Shape `(48, 64)`, the means of non-overlapping `4×4` blocks |
-
-```sh
-python spatial_mmps_reconstruct.py reconstruct --task sr \
-  --checkpoint outputs/spatial/prior.pt --observation coarse.npy \
-  --output temperature.npy --device cuda
-```
-
-The output is a `(192, 256)` array in Kelvin. The final field copies known
-pixels for the sensor and inpainting tasks, and restores block averages for
-SR. The console reports observation RMSE before and after that projection
-and the GMRES diagnostics. This assumes exact input measurements.
-
-The validated task defaults (DDPM scheduler with `clip_sample=True` and
-auto Woodbury latent-space GMRES when observations exceed the 3,072-dim
-latent space) are:
-
-| `--task` | `steps` | `warm_strength` | `sigma_k` | `maxiter` | `guidance_max_timestep` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `sensors` | 20 | 0.0 (noise) | 100 K | 8 | 500 |
-| `inpaint` | 20 | 0.0 (noise) | 10 K | 16 | 700 |
-| `sr` | 50 | 0.1 (bicubic) | 10 K | 16 | none |
-
-All defaults can be overridden via CLI flags (pass `--guidance-max-timestep -1`
-to guide every diffusion step).
-
-```sh
-python spatial_mmps_reconstruct.py evaluate --task inpaint \
-  --checkpoint outputs/spatial/prior.pt --data ../H2_Tco_jet_flames_3fields \
-  --panel 45 --output outputs/spatial/mmps-inpaint-val45.json --device cuda --resume
-```
-
-Evaluation defaults to `--panel 9` (middle slice and validation frame per
-case) and supports `--panel 45` (all five slices per case). It measures
-errors over unmeasured pixels for sensors, the missing rectangle for
-inpainting, and the full field for SR, reporting both raw and projected
-results for MAE, RMSE, gradient MAE (plus boundary gradient MAE for
-inpainting), SSIM, hot-zone MAE/RMSE/IoU/Dice at 1000 K and 1200 K,
-observation RMSE, saturation diagnostics, and GMRES statistics. Progress
-is written atomically after each frame (`status: "running"` until
-`"complete"`), and `--resume` skips already-completed compatible frames.
-
-### Benchmark reports and visual comparisons
-
-- **8-sensor comparison vs. converged original FlameDiff (ep54)**:
-  [`reports/8sensor_comparison/README.md`](./reports/8sensor_comparison/README.md) — controlled single-GPU V100S benchmark comparing a fully converged 8-sensor conditional FlameDiff (`ViTDecoder(..., num_feats=8)`, best epoch 54, `val_loss=0.007206`, identical leak-free split and `ae.pt`) against the shared unconditional prior (`e59`) + Latent MMPS:
-  - **45-frame balanced val**: RMSE **`86.79 K`** vs. `95.08 K` (`-8.7%`), raw 8-sensor RMSE **`60.59 K`** vs. `155.98 K` (`2.57×` lower, 45/45 frames won); V100S speed `1.476 s/frame` vs. `0.095 s/frame` (20-step pure-forward).
-  - **9-case held-out test**: RMSE **`92.79 K`** vs. `105.03 K` (20-step orig, `-11.7%`) and `118.02 K` (original default 1000-step, `-21.4%` & **`3.37×` faster** at `1.366 s` vs. `4.606 s/frame`), raw 8-sensor RMSE **`77.04 K`** vs. `185.23–210.78 K` (9/9 cases won).
-- **Three-task MMPS visual gallery & 45-frame benchmark**:
-  [`reports/mmps_visuals/README.md`](./reports/mmps_visuals/README.md) and [`reports/mmps_visuals/val45_benchmark_report.md`](./reports/mmps_visuals/val45_benchmark_report.md).
-
-### DPS and spatial benchmark
-
-`spatial.py` adds a separate workflow for centered inpainting and 4× spatial
-super-resolution. The original eight-sensor training and inference path still
-uses sensor tokens. The spatial workflow trains an unconditional prior with the
-same convolutional autoencoder and convolution/Transformer denoiser backbone.
-Its sampler adapts [Du et al. (2024)](https://doi.org/10.1038/s41467-024-54712-1):
-at every DDPM step it decodes the estimated clean latent, applies the observation
-operator, and uses the gradient of the observation residual to correct the next
-latent. The correction uses per-frame observation RMSE on the normalized scale.
-The same prior checkpoint serves both tasks. `--guidance 0` (or benchmark method
-`unguided`) omits the correction and the known-pixel copy. This is an adaptation
-to FlameDiff's existing architecture, rather than a reproduction of the
-paper's neural field or sequence model.
-
-| Task | Observation | Baselines |
-| --- | --- | --- |
-| `inpaint` | Mask rows `[48, 144)` and columns `[64, 192)` on a `192×256` field | `harmonic` (discrete Dirichlet interpolation), mask-conditioned `unet` |
-| `sr` | Non-overlapping `4×4` block averages give a `48×64` observation | `bilinear`, `bicubic`, residual `unet` |
-
-Operators act in array coordinates. Block averages weight array cells equally;
-they are not area-weighted physical averages on the original mesh. The final
-inpainting output copies observed values exactly. SR does not apply an output
-projection, so its observation error measures how closely the result matches
-the input when downsampled.
-
-Set `DATA=../H2_Tco_jet_flames_3fields` from the FlameDiff directory. The loader
-uses only the primary `T.npy` files. All angles of a case share the same
-zero-based frame index assignments: train `[0,130)`, validation `[140,160)`,
-test `[170,200)`. Ten frames between neighboring splits are excluded. For the
-provided dataset this gives 5,850 / 900 / 1,350 frames and 900 excluded frames.
-This is a same-case evaluation. Frames remain separate samples; grouping
-neighboring indices only reduces leakage across splits. Temperature limits
-come from the training split. Checkpoints store the split manifest and limits;
-retain the original data files when comparing runs. Legacy weights are not
-accepted as spatial checkpoints.
-
-The spatial path requires PyTorch, NumPy and `diffusers==0.32.2`. It defaults to
-CPU; use `--device cuda` on a suitable training machine. From the FlameDiff
-directory, train and evaluate as follows:
-
-```sh
+### 2. Train 3-Field `(T, OH, HO2)` Unconditional Prior
+```bash
 DATA=../H2_Tco_jet_flames_3fields
-python spatial.py train ae --data "$DATA" --output outputs/spatial/ae.pt
-python spatial.py train prior --data "$DATA" --ae-checkpoint outputs/spatial/ae.pt --output outputs/spatial/prior.pt
-python spatial.py train unet --task inpaint --data "$DATA" --output outputs/spatial/unet-inpaint.pt
-python spatial.py train unet --task sr --data "$DATA" --output outputs/spatial/unet-sr.pt
+OUT=outputs/mscae-unet-3field
 
-python spatial.py benchmark --data "$DATA" --task inpaint --method harmonic
-python spatial.py benchmark --data "$DATA" --task sr --method bicubic
-python spatial.py benchmark --data "$DATA" --task inpaint --method unet --checkpoint outputs/spatial/unet-inpaint.pt
-python spatial.py benchmark --data "$DATA" --task inpaint --method dps --checkpoint outputs/spatial/prior.pt --split val --steps 50 --guidance 1
-python spatial.py benchmark --data "$DATA" --task sr --method dps --checkpoint outputs/spatial/prior.pt --steps 50 --guidance 1 --draws 8 --output outputs/spatial/dps-sr.json
+# Stage 1: Multi-scale AE (3 fields -> 2x48x64 linear latent)
+python spatial.py train ae --data "$DATA" --fields T OH HO2 \
+  --ae-arch mscae --latent-channels 2 --ae-output-activation linear --ae-latent-activation linear \
+  --ae-loss mse --ae-grad-weight 0.02 --ae-latent-tv-weight 1e-3 --ae-channel-balance \
+  --lr-schedule cosine --learning-rate 3e-4 --batch-size 16 --epochs 80 --device cuda \
+  --output "$OUT/mscae3.pt"
+
+# Stage 2: Standardized unit-variance cosine EMA LatentUNet prior
+python spatial.py train prior --data "$DATA" --ae-checkpoint "$OUT/mscae3.pt" \
+  --prior-arch unet --standardize-latent --beta-schedule squaredcos_cap_v2 --ema-decay 0.999 \
+  --batch-size 16 --learning-rate 1e-4 --lr-schedule cosine --max-steps 120000 --device cuda \
+  --output "$OUT/unet_prior3.pt"
 ```
 
-For a training-length comparison, add `--epochs 60 --save-epochs 20 40 60`
-to the prior training command. This retains the best validation checkpoint
-at the requested output path alongside exact-epoch snapshots such as
-`prior-epoch-0020.pt`. These files are for inference; they do not store the
-optimizer state for resuming training.
+### 3. Zero-Retraining Multi-Task & Cross-Field Reconstruction
+```bash
+# 8-Sensor 3-ch (Channel-Whitened Adaptive MMPS)
+python spatial_mmps_reconstruct.py evaluate --task sensors --observed-fields T,OH,HO2 \
+  --guidance-mode mmps --mmps-channel-whiten --mmps-adaptive-weight 0.30 \
+  --checkpoint "$OUT/unet_prior3.pt" --data "$DATA" --split test --panel 9 --steps 50 --draws 4 \
+  --device cuda --output "$OUT/test9_sensors_mmps.json"
 
-The sampling settings above are examples. Select step count and guidance on
-validation data for each task and freeze them before the final test. The test
-command defaults to all test frames. `--limit`, `--train-limit`, and
-`--val-limit` support small runnable checks, whose scores are not benchmark
-results. `--method ae` diagnoses autoencoder reconstruction error with
-complete input and should be reported separately from the inverse problems.
+# Central Inpaint 3-ch (Fast Adaptive DPS, ~1.8s/draw on A100)
+python spatial_mmps_reconstruct.py evaluate --task inpaint --observed-fields T,OH,HO2 \
+  --guidance-mode dps --dps-weight 0.30 --dps-channel-balance \
+  --checkpoint "$OUT/unet_prior3.pt" --data "$DATA" --split test --panel 9 --steps 100 --draws 4 \
+  --device cuda --output "$OUT/test9_inpaint_dps.json"
 
-The benchmark reports Kelvin MAE and per-frame RMSE, fixed-range SSIM,
-finite-difference error per array cell, observation RMSE, and mean inference
-time per draw. On CUDA it also reports peak allocated GPU memory. The scored
-region is the hole for inpainting and the full
-field for SR; inpainting also reports error across the hole boundary. For
-multiple draws the report separates expected single-draw error and the error
-of the mean prediction, and summarizes output spread in the evaluated region.
-Inpainting observation RMSE is zero when known values are copied back.
-
-For a measurement-only run, supply a 2-D Kelvin `.npy` with either the
-`48×64` coarse observation or the `192×256` inpainting input (values inside the
-fixed hole are ignored). No reference field or dataset is required:
-
-```sh
-python spatial.py reconstruct --task sr --checkpoint outputs/spatial/prior.pt --observation coarse.npy --steps 50 --output recovered.npy
+# Zero-Retraining Cross-Field Inversion (Low-Res T-only -> T, OH, HO2)
+python spatial_mmps_reconstruct.py evaluate --task sr --observed-fields T \
+  --guidance-mode mmps --mmps-adaptive-weight 0.30 --warm-strength 0.0 \
+  --checkpoint "$OUT/unet_prior3.pt" --data "$DATA" --split test --panel 9 --steps 50 --draws 4 \
+  --device cuda --output "$OUT/test9_sr_tonly.json"
 ```
 
-For a validation-only warm-start ablation, run `spatial_sr_diagnostic.py`
-with `--task sr` or `--task inpaint`, a trained prior checkpoint, the matching
-`--unet-checkpoint`, and `--warm-strengths 0.1 0.25 --steps 20`. The initial
-field comes from block-mean-corrected bicubic interpolation for SR, or harmonic
-interpolation for inpainting. Each ratio retains a suffix of the DDPM timestep
-grid and noises the encoded initial field at the first retained timestep.
-The report compares interpolation, its autoencoder round trip, warm-start DPS,
-and U-Net on the same validation frame from every case/angle pair. For SR,
-compare the corrected variants, which all meet the same block-average input.
+---
 
-Add `--mmps-sigma-k 10 --mmps-maxiter 3` to that command for the exploratory
-SR-only MMPS comparison. This uses the existing prior and a local
-linearization of the decoder followed by block averaging. It propagates the
-second Tweedie moment through this linearization and uses matrix-free GMRES
-to weight the likelihood score. This is an adaptation of
-[Rozet et al.](https://papers.neurips.cc/paper_files/paper/2024/file/9f94298bac4668db4dc77ddb0a244301-Paper-Conference.pdf),
-whose observation model is linear in the state being diffused. The sigma is
-a likelihood regularizer for synthetic observations, in Kelvin, not measured
-sensor noise. The report includes per-step relative solver residuals and wall
-times. The MMPS score uses the unclipped clean latent estimate; the DDPM
-transition retains the scheduler's existing clipping. Compare the raw
-observation error as well as the corrected full-field
-and gradient errors; do not use the held-out test set to choose the sigma.
+## Key Results Summary (`test9` Held-Out Panel, 3 Fields)
 
-Once the settings are frozen, run `spatial_test.py` with the same prior and
-the validated U-Net checkpoint for each task:
+| Task | `Adap-W-MMPS` (Ours, Zero-Retrain) | `Adap-DPS` (Zero-Retrain) | 3-ch Supervised U-Net (Per-Task) |
+|---|---|---|---|
+| **8-Sensor Clean** (`T` / `OH` / `HO2`) | `71.3 K` / **`54.5%`** / `72.0%` | **`70.3 K`** / `55.8%` / **`70.0%`** | `64.3 K` / `52.8%` / `71.6%` *(OH HF 23× loss)* |
+| **8-Sensor 30% Noise** | **`74.1 K`** / **`57.0%`** / **`76.8%`** | **`72.0 K`** / **`56.9%`** / **`70.5%`** | `92.1 K` / `71.5%` / `104.6%` *(degrades 19–43%)* |
+| **Central Inpaint** | `122.6 K` / **`54.8%`** / `77.2%` | `119.8 K` / `55.6%` / `71.3%` | `104.2 K` / `47.5%` / `66.6%` *(OH HF 10× loss)* |
+| **4× SR (`T-only → 3ch`)** | **`10.2 K` / `18.0%` / `42.0%`** *(IoU 0.703)* | `10.6 K` / `18.7%` / `43.4%` | *Cannot run without retraining* |
 
-```sh
-python spatial_test.py --task sr --data "$DATA" --device cuda \
-  --prior-checkpoint outputs/spatial/prior.pt --unet-checkpoint outputs/spatial/unet-sr.pt \
-  --output outputs/spatial/sr-test.json
-```
-
-The entry point uses the entire test split, with one seeded draw per input
-for each diffusion method. It reports per-case and frame-weighted metrics for
-interpolation, U-Net, pure-noise DPS and the selected warm-start DPS variant.
-SR variants are compared before and after the same block-average correction;
-the reported inpainting scores cover the hole and its boundary. Its JSON
-contains checkpoint hashes, the split manifest, and the sampling settings.
-Progress is saved after every completed case; only `status: "complete"` is a
-final result. This test covers held-out frames from the nine available cases.
-
-The conditional residual diffusion experiment is a separate SR-only path:
-`spatial_residual_experiment.py` trains on the difference between the
-reference and the frozen residual U-Net's block-average-corrected prediction.
-The residual predictor conditions on that base and the coarse observation.
-The generated addition has zero mean in each 4×4 block, so it preserves the
-coarse input. This path does not use the AE or the unconditional MMPS prior.
-Its validation command compares the frozen base with individual draws and the
-mean of the draws on the same balanced 45-frame panel. Use these validation
-results to decide whether to keep the diffusion stage before evaluating the
-held-out test split. A smaller error of the sample mean should be reported
-separately from the error and cost of an individual draw.
-
-For center inpainting, `spatial_inpaint_experiment.py` trains masked residual
-diffusion on top of a frozen inpainting U-Net. The convolutional variant and
-the optional Transformer bottleneck use the same observed temperature field,
-known-pixel mask, and base prediction as conditions. Samples only modify the
-hole. Validation reports hole error, boundary-gradient error, distance-to-edge
-bands, and per-case results for both individual draws and their mean.
-
-On a CUDA instance with the data and the inpainting U-Net checkpoint in the
-default locations, run `bash run_inpaint_ablation.sh`. The runner performs a
-small CUDA smoke check for both variants before starting the matched training
-runs and evaluating epochs 10, 20, and 30 on the same 45 validation frames.
-Override the data and base checkpoint with `FLAMEDIFF_DATA` and
-`FLAMEDIFF_INPAINT_UNET` if needed.
+*(Original upstream Lightning scripts `encoder_training.py` / `vit_training.py` / `inference.py` remain intact for baseline reproduction.)*
