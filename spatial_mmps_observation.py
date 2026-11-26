@@ -1,16 +1,14 @@
-"""Linear observation operators for spatial latent-MMPS reconstruction.
+"""Linear observation operators for single- and multi-field spatial latent-MMPS reconstruction.
 
-All image tensors use ``[batch, 1, height, width]`` and temperature values in
-the same units/normalization as the autoencoder input.  The operators are
-linear in the image and expose ``measure`` (A) and its true adjoint
-``adjoint`` (A^T), which MMPS can compose with the latent decoder.
+All image tensors use ``[batch, num_channels, height, width]`` in the same
+units/normalization as the autoencoder input.  The operators are linear in the
+image and expose ``measure`` (A) and its exact Euclidean adjoint ``adjoint``
+(A^T), which MMPS composes with the latent decoder.
 
-The default sensor coordinates are copied from ``config/default_training.yaml``.
-They are listed as ``(x, y)`` and measurements retain that exact list order.
-Inpainting observations keep the image shape and set the missing rectangle to
-zero; NaNs in that rectangle are also accepted by ``validate_observation`` and
-ignored by the adjoint/projection.  SR observations are non-overlapping 4x4
-block means.
+Channel-selective observations (``observed_channels``) allow a single shared
+multi-field prior (e.g. ``(T, OH, HO2)``) to solve both matched multi-channel
+reconstruction and incomplete-physics cross-field inversion (e.g. observing
+only ``T`` or only ``OH`` to infer unmeasured radical fields) without retraining.
 """
 
 from __future__ import annotations
@@ -35,21 +33,16 @@ DEFAULT_SENSOR_COORDS_XY: tuple[tuple[int, int], ...] = (
 
 
 class SpatialObservation:
-    """Task-agnostic spatial measurement operator.
+    """Task-agnostic single- or multi-field spatial measurement operator.
 
     Args:
         task: ``"sensors"``, ``"inpaint"``, or ``"sr"``.
         sensor_coords_xy: Exactly eight distinct ``(x, y)`` integer locations.
             Defaults to the coordinates in ``config/default_training.yaml``.
-
-    The current benchmark geometry is fixed at ``[1, 192, 256]``.  Inpainting
-    uses the existing half-open rectangle ``[48:144, 64:192]`` and SR uses 4x4
-    block means.
-
-    ``measure`` always returns a batch-first tensor.  Finite-value validation
-    is deliberately explicit via ``validate_field`` / ``validate_observation``
-    so iterative GPU samplers do not synchronize the device at every ``A(x)``.
-    Shape and dtype checks remain active on every public operation.
+        num_channels: Total number of physical channels in the full field
+            (default ``1`` for single-channel temperature; ``3`` for ``(T, OH, HO2)``).
+        observed_channels: Subset of channel indices ``[0, num_channels)`` that
+            are actually observed. Defaults to all channels.
     """
 
     FIELD_SHAPE = (1, 192, 256)
@@ -61,12 +54,34 @@ class SpatialObservation:
         task: str,
         *,
         sensor_coords_xy: Sequence[Sequence[int]] | None = None,
+        num_channels: int = 1,
+        observed_channels: Sequence[int] | None = None,
     ) -> None:
         if not isinstance(task, str) or task not in {"sensors", "inpaint", "sr"}:
             raise ValueError("task must be one of: sensors, inpaint, sr")
+        if isinstance(num_channels, bool) or not isinstance(num_channels, Integral) or num_channels < 1:
+            raise ValueError("num_channels must be a positive integer")
         self.task = task
+        self.num_channels = int(num_channels)
 
-        self.field_shape = self.FIELD_SHAPE
+        if observed_channels is None:
+            self.observed_channels: tuple[int, ...] = tuple(range(self.num_channels))
+        else:
+            parsed = []
+            for ch in observed_channels:
+                if isinstance(ch, bool) or not isinstance(ch, Integral):
+                    raise ValueError("observed_channels must contain integer channel indices")
+                ch_int = int(ch)
+                if not 0 <= ch_int < self.num_channels:
+                    raise ValueError(f"observed channel index {ch_int} out of range [0, {self.num_channels})")
+                if ch_int not in parsed:
+                    parsed.append(ch_int)
+            if not parsed:
+                raise ValueError("observed_channels must contain at least one channel")
+            self.observed_channels = tuple(parsed)
+        self.num_observed_channels = len(self.observed_channels)
+
+        self.field_shape = (self.num_channels, self.FIELD_SHAPE[1], self.FIELD_SHAPE[2])
         _, self.height, self.width = self.field_shape
         self.scale = self.SCALE
         self.y0, self.y1, self.x0, self.x1 = self.HOLE_BOUNDS
@@ -93,18 +108,25 @@ class SpatialObservation:
         ):
             raise ValueError("sensor coordinates must lie inside field_shape")
 
-        # Flattened indices use standard row-major image order, converting the
-        # public/config (x, y) coordinates to index y * width + x.
         self._sensor_indices_cpu = tuple(y * self.width + x for x, y in self.sensor_coords_xy)
         self._sensor_indices_cache: dict[torch.device, torch.Tensor] = {}
+        self._obs_channel_indices_cache: dict[torch.device, torch.Tensor] = {}
         self._sensor_pixel_mask_cache: dict[torch.device, torch.Tensor] = {}
         self._base_mask_cache: dict[torch.device, torch.Tensor] = {}
+        self._obs_spatial_mask_cache: dict[torch.device, torch.Tensor] = {}
 
     def _sensor_indices(self, device: torch.device) -> torch.Tensor:
         indices = self._sensor_indices_cache.get(device)
         if indices is None:
             indices = torch.tensor(self._sensor_indices_cpu, dtype=torch.long, device=device)
             self._sensor_indices_cache[device] = indices
+        return indices
+
+    def _obs_channel_indices(self, device: torch.device) -> torch.Tensor:
+        indices = self._obs_channel_indices_cache.get(device)
+        if indices is None:
+            indices = torch.tensor(self.observed_channels, dtype=torch.long, device=device)
+            self._obs_channel_indices_cache[device] = indices
         return indices
 
     def _sensor_pixel_mask(self, device: torch.device) -> torch.Tensor:
@@ -117,8 +139,9 @@ class SpatialObservation:
             self._sensor_pixel_mask_cache[device] = pixel_mask
         return pixel_mask
 
-    def _base_mask(self, device: torch.device) -> torch.Tensor:
-        mask = self._base_mask_cache.get(device)
+    def _obs_spatial_mask(self, device: torch.device) -> torch.Tensor:
+        """Spatial bool mask of shape [1, 1, H, W] for observed channels."""
+        mask = self._obs_spatial_mask_cache.get(device)
         if mask is None:
             mask = torch.ones((1, 1, self.height, self.width), dtype=torch.bool, device=device)
             if self.task == "inpaint":
@@ -128,6 +151,19 @@ class SpatialObservation:
                 ys = torch.tensor([y for _, y in self.sensor_coords_xy], dtype=torch.long, device=device)
                 xs = torch.tensor([x for x, _ in self.sensor_coords_xy], dtype=torch.long, device=device)
                 mask[:, 0, ys, xs] = True
+            self._obs_spatial_mask_cache[device] = mask
+        return mask
+
+    def _base_mask(self, device: torch.device) -> torch.Tensor:
+        """Full-field bool mask of shape [1, num_channels, H, W]."""
+        mask = self._base_mask_cache.get(device)
+        if mask is None:
+            spatial = self._obs_spatial_mask(device)
+            mask = torch.zeros(
+                (1, self.num_channels, self.height, self.width), dtype=torch.bool, device=device
+            )
+            for ch in self.observed_channels:
+                mask[:, ch : ch + 1] = spatial
             self._base_mask_cache[device] = mask
         return mask
 
@@ -135,19 +171,21 @@ class SpatialObservation:
     def shape(self) -> tuple[int, ...]:
         """Observation shape excluding batch."""
         if self.task == "sensors":
-            return (8,)
+            if self.num_channels == 1:
+                return (8,)
+            return (self.num_observed_channels, 8)
         if self.task == "inpaint":
-            return self.field_shape
-        return (1, self.height // self.scale, self.width // self.scale)
+            return (self.num_observed_channels, self.height, self.width)
+        return (self.num_observed_channels, self.height // self.scale, self.width // self.scale)
 
     @property
     def measured_count(self) -> int:
         """Number of scalar measurements per sample."""
         if self.task == "sensors":
-            return 8
+            return 8 * self.num_observed_channels
         if self.task == "inpaint":
-            return self.height * self.width - (self.y1 - self.y0) * (self.x1 - self.x0)
-        return (self.height // self.scale) * (self.width // self.scale)
+            return (self.height * self.width - (self.y1 - self.y0) * (self.x1 - self.x0)) * self.num_observed_channels
+        return (self.height // self.scale) * (self.width // self.scale) * self.num_observed_channels
 
     def _check_image(self, field: torch.Tensor) -> None:
         if not isinstance(field, torch.Tensor):
@@ -181,6 +219,15 @@ class SpatialObservation:
             raise ValueError("field contains NaN or infinite values")
         return field
 
+    def observation_mask(self, observation: torch.Tensor) -> torch.Tensor:
+        """Return bool mask matching an inpainting observation's shape [B, C_obs, H, W]."""
+        self._check_observation(observation)
+        if self.task != "inpaint":
+            return torch.ones_like(observation, dtype=torch.bool)
+        return self._obs_spatial_mask(observation.device).expand(
+            observation.shape[0], self.num_observed_channels, -1, -1
+        ).clone()
+
     def validate_observation(
         self,
         observation: torch.Tensor,
@@ -189,11 +236,7 @@ class SpatialObservation:
         reference: torch.Tensor | None = None,
         finite: bool = True,
     ) -> torch.Tensor:
-        """Validate an observation; missing inpaint cells may contain NaN/Inf.
-
-        ``reference`` can be supplied to also require matching batch, device,
-        and dtype.  Inpaint values inside the unknown rectangle are ignored.
-        """
+        """Validate an observation; missing inpaint cells may contain NaN/Inf."""
         self._check_observation(observation, batch_size=batch_size)
         if reference is not None:
             self._check_image(reference)
@@ -203,7 +246,7 @@ class SpatialObservation:
                 raise ValueError("field and observation must have the same device and dtype")
         if finite:
             if self.task == "inpaint":
-                known = self.mask(observation)
+                known = self.observation_mask(observation)
                 values = observation.masked_select(known)
                 is_finite = torch.isfinite(values).all()
             else:
@@ -215,11 +258,8 @@ class SpatialObservation:
     def mask(self, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Return image-space bool mask (True where the field is observed).
 
-        For ``sensors`` only the eight configured pixels are True; for
-        ``inpaint`` the mask is False in the missing rectangle; SR returns all
-        True because every field cell contributes to a block measurement.
-        The result has shape ``[B, 1, H, W]`` and follows ``reference`` device
-        and batch when provided (otherwise batch size is one on CPU).
+        Returns shape ``[B, num_channels, H, W]``. Unobserved channels are
+        False everywhere.
         """
         if reference is None:
             batch_size, device = 1, torch.device("cpu")
@@ -229,65 +269,93 @@ class SpatialObservation:
 
         return self._base_mask(device).expand(batch_size, -1, -1, -1).clone()
 
+    def _select_observed_channels(self, field: torch.Tensor) -> torch.Tensor:
+        if self.num_observed_channels == self.num_channels and self.observed_channels == tuple(range(self.num_channels)):
+            return field
+        return field.index_select(1, self._obs_channel_indices(field.device))
+
     def measure(self, field: torch.Tensor) -> torch.Tensor:
         """Apply ``A`` to a batch of fields while preserving gradients."""
         self._check_image(field)
+        selected = self._select_observed_channels(field)
         if self.task == "sensors":
             indices = self._sensor_indices(field.device)
-            return field[:, 0].flatten(1).index_select(1, indices)
+            values = selected.flatten(2).index_select(2, indices)  # [B, C_obs, 8]
+            if self.num_channels == 1:
+                return values[:, 0]
+            return values
         if self.task == "inpaint":
             zero = torch.zeros((), dtype=field.dtype, device=field.device)
-            return torch.where(self._base_mask(field.device), field, zero)
-        return F.avg_pool2d(field, kernel_size=self.scale, stride=self.scale)
+            return torch.where(self._obs_spatial_mask(field.device), selected, zero)
+        return F.avg_pool2d(selected, kernel_size=self.scale, stride=self.scale)
+
+    def _scatter_observed_channels(self, obs_full_spatial: torch.Tensor) -> torch.Tensor:
+        if self.num_observed_channels == self.num_channels and self.observed_channels == tuple(range(self.num_channels)):
+            return obs_full_spatial
+        out = torch.zeros(
+            (obs_full_spatial.shape[0], self.num_channels, self.height, self.width),
+            dtype=obs_full_spatial.dtype,
+            device=obs_full_spatial.device,
+        )
+        ch_idx = self._obs_channel_indices(obs_full_spatial.device).view(1, -1, 1, 1).expand_as(obs_full_spatial)
+        return out.scatter(1, ch_idx, obs_full_spatial)
 
     def adjoint(self, observation: torch.Tensor) -> torch.Tensor:
         """Apply the exact Euclidean adjoint ``A^T`` in image space."""
         self._check_observation(observation)
         batch_size = observation.shape[0]
         if self.task == "sensors":
+            obs_3d = observation.unsqueeze(1) if self.num_channels == 1 else observation
             flat = torch.zeros(
-                (batch_size, self.height * self.width),
+                (batch_size, self.num_observed_channels, self.height * self.width),
                 dtype=observation.dtype,
                 device=observation.device,
             )
-            indices = self._sensor_indices(observation.device)
-            flat = flat.scatter(1, indices.expand(batch_size, -1), observation)
-            return flat.reshape(batch_size, 1, self.height, self.width)
+            indices = self._sensor_indices(observation.device).view(1, 1, -1).expand(
+                batch_size, self.num_observed_channels, -1
+            )
+            flat = flat.scatter(2, indices, obs_3d)
+            spatial = flat.reshape(batch_size, self.num_observed_channels, self.height, self.width)
+            return self._scatter_observed_channels(spatial)
         if self.task == "inpaint":
             zero = torch.zeros((), dtype=observation.dtype, device=observation.device)
-            return torch.where(self._base_mask(observation.device), observation, zero)
+            spatial = torch.where(self._obs_spatial_mask(observation.device), observation, zero)
+            return self._scatter_observed_channels(spatial)
         repeated = observation.repeat_interleave(self.scale, dim=-2)
         repeated = repeated.repeat_interleave(self.scale, dim=-1)
-        return repeated / (self.scale**2)
+        return self._scatter_observed_channels(repeated / (self.scale**2))
 
     def project(self, field: torch.Tensor, observation: torch.Tensor) -> torch.Tensor:
-        """Project ``field`` onto ``A(x) = observation`` when feasible.
-
-        This is the orthogonal affine projection for each operator: overwrite
-        sensor/known pixels, or distribute each SR block-mean discrepancy
-        equally over that block.  Projection remains differentiable in both
-        arguments.  The caller should call ``validate_observation`` once before
-        an iterative sampling loop; missing inpaint values are ignored.
-        """
+        """Project ``field`` onto ``A(x) = observation`` on observed channels only."""
         self._check_image(field)
         self._check_observation(observation, batch_size=field.shape[0])
         if observation.device != field.device or observation.dtype != field.dtype:
             raise ValueError("field and observation must have the same device and dtype")
 
         if self.task == "sensors":
-            flat_field = field.flatten(2)
+            obs_3d = observation.unsqueeze(1) if self.num_channels == 1 else observation
             indices = self._sensor_indices(field.device)
             pixel_mask = self._sensor_pixel_mask(field.device)
-            measured = torch.zeros_like(flat_field).scatter(
-                2, indices.view(1, 1, -1).expand(field.shape[0], -1, -1), observation.unsqueeze(1)
+            selected = self._select_observed_channels(field).flatten(2)
+            measured = torch.zeros_like(selected).scatter(
+                2, indices.view(1, 1, -1).expand(field.shape[0], self.num_observed_channels, -1), obs_3d
             )
-            return torch.where(pixel_mask, measured, flat_field).reshape_as(field)
-        if self.task == "inpaint":
-            return torch.where(self._base_mask(field.device), observation, field)
+            updated_obs = torch.where(pixel_mask, measured, selected).reshape(
+                field.shape[0], self.num_observed_channels, self.height, self.width
+            )
+        elif self.task == "inpaint":
+            selected = self._select_observed_channels(field)
+            updated_obs = torch.where(self._obs_spatial_mask(field.device), observation, selected)
+        else:
+            discrepancy = observation - self.measure(field)
+            correction = discrepancy.repeat_interleave(self.scale, dim=-2)
+            correction = correction.repeat_interleave(self.scale, dim=-1)
+            updated_obs = self._select_observed_channels(field) + correction
 
-        discrepancy = observation - self.measure(field)
-        correction = discrepancy.repeat_interleave(self.scale, dim=-2)
-        correction = correction.repeat_interleave(self.scale, dim=-1)
-        return field + correction
+        if self.num_observed_channels == self.num_channels and self.observed_channels == tuple(range(self.num_channels)):
+            return updated_obs
+        ch_idx = self._obs_channel_indices(field.device).view(1, -1, 1, 1).expand_as(updated_obs)
+        return field.scatter(1, ch_idx, updated_obs)
+
 
 __all__ = ["DEFAULT_SENSOR_COORDS_XY", "SpatialObservation"]

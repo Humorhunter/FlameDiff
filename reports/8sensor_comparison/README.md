@@ -40,9 +40,9 @@
 | 对比维度 | 收敛原版 FlameDiff (`orig_cond`) | 本方法 (`e59` + Latent MMPS) |
 |---|---|---|
 | 数据划分 | 无泄漏时间块划分（9 工况，`val45` + `test9`） | 完全相同 |
-| 自编码器 | 1-channel `ae.pt`（潜空间 `1×24×32`） | 完全相同 |
+| 自编码器 | 1-channel `ae.pt`（潜空间 `1×48×64`） | 完全相同 |
 | 扩散主干 | `ViTDecoder(embed_dim=256, depth=8, num_feats=8)`（57 MB） | `ViTDecoder(embed_dim=256, depth=8, unconditional)`（57 MB） |
-| 训练超参 | `AdamW, bs=8, lr=2e-5, 60 epochs`（V100S 耗时 `42.1 min`） | `AdamW, bs=8, lr=2e-5, 60 epochs` |
+| 训练超参 | `Adam, bs=8, lr=2e-5, 60 epochs`（V100S 耗时 `42.1 min`） | `Adam, bs=4, lr=1e-5, 60 epochs` |
 | 收敛指标 | 最佳 **epoch 54**, `val_loss = 0.007206` | 最佳 **epoch 59**, `val_loss = 0.00884` |
 | 8 测点利用机制 | 训练期条件 token 拼接（纯前向软引导） | 推理期 Latent MMPS 线性后验求解（`t≤500` 引导 10 步，GMRES `maxiter=8`, `σ_k=100 K`） |
 | 推理评测硬件 | 单卡 `Tesla V100S-PCIE-32GB` | 单卡 `Tesla V100S-PCIE-32GB` |

@@ -613,11 +613,15 @@ class TestMetricsAndResume(unittest.TestCase):
 
             expected_keys = {
                 "mae_k",
+                "nmae_pct",
                 "rmse_k",
                 "gradient_mae_k_per_grid_cell",
                 "boundary_gradient_mae_k_per_grid_cell",
                 "ssim",
                 "observation_rmse_k",
+                "hf_energy_ratio_pred",
+                "hf_energy_ratio_gt",
+                "log_spectrum_rel_error_pct",
                 "hot_mae_1000k_k",
                 "hot_rmse_1000k_k",
                 "hot_iou_1000k",
@@ -639,9 +643,9 @@ class TestMetricsAndResume(unittest.TestCase):
             json.dumps(m, allow_nan=False)
 
     def test_parse_device(self) -> None:
-        for valid in ("cpu", "cuda", "cuda:0", "cuda:12"):
+        for valid in ("cpu", "mps", "cuda", "cuda:0", "cuda:12"):
             self.assertEqual(parse_device(valid), valid)
-        for invalid in ("mps", "cuda:-1", "cuda:abc", "gpu", "cuda:"):
+        for invalid in ("tpu", "cuda:-1", "cuda:abc", "gpu", "cuda:"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 parse_device(invalid)
 
@@ -945,6 +949,384 @@ class TestMetricsAndResume(unittest.TestCase):
             self.assertIn("summary_observation", final)
             self.assertIn("hot_iou_1000k", final["summary_metrics"])
             self.assertFalse(out_path.with_name(out_path.name + ".tmp").exists())
+
+
+class TestMultiFieldAndBaseFixes(unittest.TestCase):
+    """Tests for 3-field (T, OH, HO2) support, channel-selective MMPS, latent standardization, and spectral/CRPS metrics."""
+
+    def test_multifield_observation_adjoint_and_project_all_modes(self) -> None:
+        torch.manual_seed(11)
+        field = torch.randn((2, 3, 192, 256), dtype=torch.float64)
+        for task in ("sensors", "inpaint", "sr"):
+            for obs_ch in ((0, 1, 2), (0,), (1,), (0, 2)):
+                op = SpatialObservation(task, num_channels=3, observed_channels=obs_ch)
+                y = op.measure(field)
+                self.assertEqual(tuple(y.shape), (2, *op.shape))
+                # Exact Euclidean adjoint <Ax, v> == <x, A^T v>
+                v = torch.randn_like(y)
+                lhs = float((y * v).sum().item())
+                rhs = float((field * op.adjoint(v)).sum().item())
+                self.assertAlmostEqual(lhs, rhs, places=9, msg=f"{task} obs_ch={obs_ch}")
+
+                # Projection satisfies A(P(x, y)) == y and leaves unobserved channels untouched
+                other = torch.randn_like(field)
+                projected = op.project(other, y)
+                self.assertTrue(torch.allclose(op.measure(projected), y, atol=1e-10))
+                for ch in range(3):
+                    if ch not in obs_ch:
+                        self.assertTrue(torch.equal(projected[:, ch], other[:, ch]))
+
+    def test_linear_multifield_ae_zero_dead_relu_and_latent_scale(self) -> None:
+        from model.EnDeCoder import AutoEnDecoder
+        from spatial import compute_latent_scale
+
+        torch.manual_seed(7)
+        ae = AutoEnDecoder(
+            in_channels=3,
+            latent_channels=2,
+            output_activation="linear",
+            latent_activation="linear",
+        ).eval()
+        # Cold-zero input (normalized T=0, OH=0, HO2=0) must retain non-zero gradients with linear output
+        x = torch.zeros((1, 3, 192, 256), dtype=torch.float32)
+        z = ae.encoder(x).detach().requires_grad_(True)
+        out = ae.decoder(z)
+        self.assertEqual(tuple(out.shape), (1, 3, 192, 256))
+        grad_z, = torch.autograd.grad(out[:, 0, 95, 20].sum(), z)
+        self.assertGreater(float(grad_z.norm().item()), 1e-6)
+
+        # Latent standardization produces exact zero-mean unit-variance per channel
+        batch = torch.randn((4, 3, 192, 256)) * 0.2 + 0.3
+        scale = compute_latent_scale(ae, [batch], torch.device("cpu"))
+        self.assertEqual(len(scale["mean"]), 2)
+        self.assertEqual(len(scale["std"]), 2)
+        with torch.no_grad():
+            z_raw = ae.encoder(batch)
+            mean_t = torch.tensor(scale["mean"]).view(1, 2, 1, 1)
+            std_t = torch.tensor(scale["std"]).view(1, 2, 1, 1)
+            z_std = (z_raw - mean_t) / std_t
+            self.assertAlmostEqual(float(z_std.mean().item()), 0.0, places=4)
+            self.assertAlmostEqual(float(z_std.std(unbiased=False).item()), 1.0, places=3)
+
+    def test_three_field_reconstructor_matched_and_t_only_all_tasks(self) -> None:
+        from model.EnDeCoder import AutoEnDecoder
+        from model.ViTDecoder import ViTDecoder
+        from spatial import CHECKPOINT_VERSION
+
+        torch.manual_seed(3)
+        ae = AutoEnDecoder(
+            in_channels=3,
+            latent_channels=2,
+            output_activation="linear",
+            latent_activation="linear",
+        ).eval()
+        prior = ViTDecoder(d_model=16, num_heads=2, num_layers=1, num_feats=0, in_channels=2).eval()
+        ckpt = {
+            "version": CHECKPOINT_VERSION,
+            "stage": "prior",
+            "epoch": 1,
+            "fields": ["T", "OH", "HO2"],
+            "field_ranges": {
+                "T": [300.0, 1600.0],
+                "OH": [0.0, 2.5e-3],
+                "HO2": [0.0, 1.5e-4],
+            },
+            "diffusion_steps": 20,
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": False,
+            "latent_scale": {"mean": [0.05, -0.05], "std": [0.25, 0.30]},
+            "ae_config": {
+                "in_channels": 3,
+                "latent_channels": 2,
+                "output_activation": "linear",
+                "latent_activation": "linear",
+            },
+            "ae_weights": ae.state_dict(),
+            "model_config": {"d_model": 16, "num_heads": 2, "num_layers": 1, "num_feats": 0, "in_channels": 2},
+            "weights": prior.state_dict(),
+        }
+        target = torch.stack([
+            torch.full((192, 256), 1100.0),
+            torch.full((192, 256), 5e-4),
+            torch.full((192, 256), 2e-5),
+        ], dim=0).unsqueeze(0)
+        target = target + torch.randn_like(target) * torch.tensor([50.0, 1e-4, 5e-6]).view(1, 3, 1, 1)
+
+        for task, obs_fields in (
+            ("sensors", "T,OH,HO2"),
+            ("sensors", "T"),
+            ("inpaint", "T"),
+            ("sr", "T,OH,HO2"),
+            ("sr", "T"),
+        ):
+            args = SimpleNamespace(
+                task=task,
+                observed_fields=obs_fields,
+                device="cpu",
+                seed=0,
+                steps=2,
+                maxiter=2,
+                sigma_k=None,
+                sigma_norm=0.05,
+                warm_strength=None,
+            )
+            rec = TemperatureReconstructor(args, ckpt)
+            self.assertTrue(rec.clip_sample)
+            self.assertAlmostEqual(rec.clip_sample_range, 4.0)
+            self.assertEqual(rec.timestep_spacing, "trailing")
+            self.assertEqual(rec.beta_schedule, "squaredcos_cap_v2")
+            obs = rec.operator.measure(target)
+            proj, raw, diag = rec.reconstruct(obs, seed=0)
+            self.assertEqual(tuple(proj.shape), (1, 3, 192, 256))
+            self.assertEqual(tuple(raw.shape), (1, 3, 192, 256))
+            self.assertAlmostEqual(diag["observation_rmse_norm_after_projection"], 0.0, places=4)
+            m = rec.metrics(proj, target, obs)
+            self.assertIn("per_channel", m)
+            self.assertEqual(set(m["per_channel"].keys()), {"T", "OH", "HO2"})
+            for fn in ("T", "OH", "HO2"):
+                self.assertIn("nmae_pct", m["per_channel"][fn])
+                self.assertIn("log_spectrum_rel_error_pct", m["per_channel"][fn])
+            # Unobserved channels have observation_rmse=None
+            if obs_fields == "T":
+                self.assertIsNone(m["per_channel"]["OH"]["observation_rmse"])
+                self.assertIsNone(m["per_channel"]["HO2"]["observation_rmse"])
+
+    def test_spectral_and_crps_metrics_exact(self) -> None:
+        from spatial_mmps_reconstruct import gaussian_crps, spectral_metrics
+
+        torch.manual_seed(0)
+        gt = torch.randn((192, 256))
+        m_exact = spectral_metrics(gt, gt)
+        self.assertAlmostEqual(m_exact["log_spectrum_rel_error_pct"], 0.0, places=6)
+        self.assertAlmostEqual(m_exact["hf_energy_ratio_pred"], m_exact["hf_energy_ratio_gt"], places=6)
+
+        mu = gt.unsqueeze(0).unsqueeze(0)
+        std = torch.full_like(mu, 0.1)
+        region = torch.ones_like(mu, dtype=torch.bool)
+        crps_good = gaussian_crps(mu, std, mu, region)
+        crps_bad = gaussian_crps(mu + 2.0, std, mu, region)
+        self.assertLess(crps_good, crps_bad)
+
+    def test_mscae_and_latent_unet_end_to_end_mmps_and_dps(self) -> None:
+        from model.EnDeCoder import MultiScaleAutoEnDecoder, build_autoencoder
+        from model.LatentUNet import LatentUNet
+        from spatial import _latent_tv_loss, load_prior_model
+        from spatial_mmps_reconstruct import TemperatureReconstructor
+
+        torch.manual_seed(7)
+        ae_cfg = {
+            "arch": "mscae",
+            "in_channels": 3,
+            "latent_channels": 1,
+            "output_activation": "linear",
+            "latent_activation": "linear",
+            "base_channels": 12,
+        }
+        ae = build_autoencoder(ae_cfg).eval()
+        self.assertIsInstance(ae, MultiScaleAutoEnDecoder)
+        x = torch.randn((1, 3, 192, 256))
+        z = ae.encoder(x)
+        self.assertEqual(tuple(z.shape), (1, 1, 48, 64))
+        self.assertGreater(float(_latent_tv_loss(z).item()), 0.0)
+        self.assertAlmostEqual(float(_latent_tv_loss(torch.ones_like(z)).item()), 0.0, places=6)
+
+        # Verify zero dead-ReLU on MSCAE decoder
+        z_probe = torch.randn((1, 1, 48, 64), requires_grad=True)
+        out_probe = ae.decoder(z_probe)
+        self.assertEqual(tuple(out_probe.shape), (1, 3, 192, 256))
+        op_s = SpatialObservation("sensors", num_channels=3)
+        meas = op_s.measure(out_probe)
+        for c in range(3):
+            for s in range(8):
+                grad, = torch.autograd.grad(meas[0, c, s], z_probe, retain_graph=True)
+                self.assertGreater(float(grad.abs().sum().item()), 0.0)
+
+        # LatentUNet supports both float32 and float64 + matches ViTDecoder interface
+        unet_cfg = {
+            "in_channels": 1,
+            "base_channels": 8,
+            "channel_mults": [1, 1, 2, 2],
+            "num_res_blocks": 1,
+            "attention_levels": [2, 3],
+            "num_heads": 2,
+        }
+        unet = LatentUNet(**unet_cfg).eval()
+        eps32 = unet(z, None, torch.tensor([[5]]))
+        self.assertEqual(tuple(eps32.shape), tuple(z.shape))
+        unet64 = LatentUNet(**unet_cfg).double().eval()
+        eps64 = unet64(z.double(), None, torch.tensor([[5]]))
+        self.assertEqual(eps64.dtype, torch.float64)
+
+        ckpt = {
+            "version": 1,
+            "stage": "prior",
+            "fields": ["T", "OH", "HO2"],
+            "field_ranges": {"T": [300.0, 1600.0], "OH": [0.0, 2.5e-3], "HO2": [0.0, 1.5e-4]},
+            "channel_stats": {
+                "T": {"norm_std": 0.15, "std": 200.0},
+                "OH": {"norm_std": 0.12, "std": 3e-4},
+                "HO2": {"norm_std": 0.08, "std": 1.2e-5},
+            },
+            "prior_arch": "unet",
+            "model_config": unet_cfg,
+            "weights": unet.state_dict(),
+            "ae_config": ae_cfg,
+            "ae_weights": ae.state_dict(),
+            "latent_scale": {"mean": [0.0], "std": [1.0]},
+            "beta_schedule": "squaredcos_cap_v2",
+            "clip_sample": False,
+            "diffusion_steps": 10,
+            "epoch": 1,
+        }
+        loaded = load_prior_model(ckpt, torch.device("cpu"))
+        self.assertIsInstance(loaded, LatentUNet)
+
+        target = torch.stack(
+            [
+                torch.full((192, 256), 950.0),
+                torch.full((192, 256), 5e-4),
+                torch.full((192, 256), 3e-5),
+            ],
+            dim=0,
+        ).unsqueeze(0)
+
+        for mode, task, obs_f in (
+            ("mmps", "sensors", "T,OH,HO2"),
+            ("dps", "sensors", "T,OH,HO2"),
+            ("dps", "inpaint", "T,OH,HO2"),
+            ("dps", "sr", "T"),
+        ):
+            args = SimpleNamespace(
+                task=task,
+                observed_fields=obs_f,
+                device="cpu",
+                seed=0,
+                steps=2,
+                maxiter=2,
+                sigma_k=None,
+                sigma_norm=0.05,
+                warm_strength=None,
+                guidance_mode=mode,
+                dps_weight=0.30,
+                dps_channel_balance=True,
+            )
+            rec = TemperatureReconstructor(args, ckpt)
+            self.assertEqual(rec.prior_arch, "unet")
+            self.assertEqual(rec.guidance_mode, mode)
+            obs = rec.operator.measure(target)
+            proj, raw, diag = rec.reconstruct(obs, seed=0)
+            self.assertEqual(tuple(proj.shape), (1, 3, 192, 256))
+            self.assertTrue(torch.isfinite(proj).all().item())
+            self.assertAlmostEqual(diag["observation_rmse_norm_after_projection"], 0.0, places=4)
+            if mode == "dps":
+                self.assertEqual(diag["solver_space_used"], "adaptive_dps")
+
+    def test_leave_one_case_out_split_zero_leakage(self) -> None:
+        import numpy as np
+        from spatial_data import DATA_DIRECTORY, FRAME_COUNT, FRAME_SHAPE, TemperatureData
+        from spatial_mmps_reconstruct import evaluation_panel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / DATA_DIRECTORY
+            for case, base_val in (("T1030", 400.0), ("T1050", 900.0)):
+                sdir = root / case / "grade_192_256_npdata_1"
+                sdir.mkdir(parents=True)
+                arr_t = np.full((FRAME_COUNT, *FRAME_SHAPE), base_val, dtype=np.float32)
+                arr_t[:, 0, 0] = base_val + 100.0
+                np.save(sdir / "T.npy", arr_t)
+
+            data = TemperatureData(tmp, fields=("T",), holdout_cases=("T1050",))
+            # Training range MUST reflect only T1030 [400, 500], NOT T1050 [900, 1000]!
+            lo, hi = data.training_range()
+            self.assertAlmostEqual(lo, 400.0)
+            self.assertAlmostEqual(hi, 500.0)
+            manifest = data.split_manifest()
+            self.assertEqual(manifest["holdout_cases"], ["T1050"])
+            self.assertEqual([f["case"] for f in manifest["files"]], ["T1030"])
+
+            ds_holdout, samples_holdout = evaluation_panel(data, "holdout", (lo, hi))
+            self.assertEqual(len(ds_holdout), 1)
+            self.assertEqual(samples_holdout[0]["case"], "T1050")
+            # Holdout frame normalized by T1030 range (400..500): (900-400)/100 = 5.0
+            self.assertAlmostEqual(float(ds_holdout[0][0, 1, 1].item()), 5.0, places=4)
+
+    def test_channel_whitened_and_adaptive_mmps_exact(self) -> None:
+        from model.EnDeCoder import build_autoencoder
+        from model.LatentUNet import LatentUNet
+        from spatial_mmps import mmps_guidance
+        from spatial_mmps_reconstruct import TemperatureReconstructor
+
+        torch.manual_seed(11)
+        # 1. Verify mathematical identity: whitened MMPS (W A, W y, sigma) matches explicit
+        # anisotropic covariance Sigma_y = sigma^2 W^{-2} in BOTH observation and latent spaces!
+        cur = torch.randn((1, 2, 4, 4), dtype=torch.float64, requires_grad=True)
+        W_lin = torch.randn((2 * 16, 2 * 16), dtype=torch.float64) * 0.2
+        clean = (cur.reshape(1, -1) @ W_lin.T).reshape(1, 2, 4, 4)
+        A = torch.randn((6, 2 * 16), dtype=torch.float64)
+        w = torch.tensor([0.5, 0.5, 1.0, 1.0, 2.5, 2.5], dtype=torch.float64)  # diagonal whitening
+        y = torch.randn((1, 6), dtype=torch.float64)
+        sigma = 0.25
+        alpha_bar = 0.6
+
+        def meas_w(z):
+            return (z.reshape(1, -1) @ A.T) * w.unsqueeze(0)
+
+        score_obs, d_obs = mmps_guidance(
+            cur, clean, y * w.unsqueeze(0), meas_w, alpha_bar,
+            sigma=sigma, maxiter=6, solver_space="observation",
+        )
+        score_lat, d_lat = mmps_guidance(
+            cur, clean, y * w.unsqueeze(0), meas_w, alpha_bar,
+            sigma=sigma, maxiter=32, solver_space="latent",
+        )
+        self.assertEqual(d_obs["converged"], 1.0)
+        self.assertEqual(d_lat["converged"], 1.0)
+        self.assertTrue(torch.allclose(score_obs, score_lat, atol=1e-6, rtol=1e-5))
+
+        # Closed-form reference with explicit anisotropic Sigma_y = diag((sigma / w)^2)
+        with torch.no_grad():
+            cov_scale = (1.0 - alpha_bar) / (alpha_bar ** 0.5)
+            S = cov_scale * W_lin.T  # J_mu^T = W_lin^T
+            Sigma_y = torch.diag((sigma / w) ** 2)
+            r = (y - (clean.reshape(1, -1) @ A.T)).squeeze(0)
+            sys_mat = Sigma_y + A @ S @ A.T
+            ref = (W_lin.T @ (A.T @ torch.linalg.solve(sys_mat, r))).reshape(1, 2, 4, 4)
+        self.assertTrue(torch.allclose(score_obs, ref, atol=1e-6, rtol=1e-5))
+
+        # 2. Verify TemperatureReconstructor full-rank maxiter=24 for 3ch sensors + whitening + adaptive weight
+        ae_cfg = {"arch": "mscae", "in_channels": 3, "latent_channels": 2, "output_activation": "linear", "latent_activation": "linear", "base_channels": 12}
+        ae = build_autoencoder(ae_cfg).eval()
+        unet_cfg = {"in_channels": 2, "base_channels": 8, "channel_mults": [1, 1, 2, 2], "num_res_blocks": 1, "attention_levels": [2, 3], "num_heads": 2}
+        unet = LatentUNet(**unet_cfg).eval()
+        ckpt = {
+            "version": 1, "stage": "prior", "fields": ["T", "OH", "HO2"],
+            "field_ranges": {"T": [300.0, 1600.0], "OH": [0.0, 2.5e-3], "HO2": [0.0, 1.5e-4]},
+            "channel_stats": {
+                "T": {"norm_std": 0.15, "std": 200.0},
+                "OH": {"norm_std": 0.12, "std": 3e-4},
+                "HO2": {"norm_std": 0.08, "std": 1.2e-5},
+            },
+            "prior_arch": "unet", "model_config": unet_cfg, "weights": unet.state_dict(),
+            "ae_config": ae_cfg, "ae_weights": ae.state_dict(),
+            "latent_scale": {"mean": [0.0, 0.0], "std": [1.0, 1.0]},
+            "beta_schedule": "squaredcos_cap_v2", "clip_sample": False, "diffusion_steps": 10, "epoch": 1,
+        }
+        target = torch.stack([torch.full((192, 256), 950.0), torch.full((192, 256), 5e-4), torch.full((192, 256), 3e-5)], dim=0).unsqueeze(0)
+        for task in ("sensors", "inpaint", "sr"):
+            args = SimpleNamespace(
+                task=task, observed_fields="T,OH,HO2", device="cpu", seed=0, steps=2,
+                maxiter=None if task == "sensors" else 2, sigma_k=None, sigma_norm=0.05, warm_strength=0.0,
+                guidance_mode="mmps", mmps_channel_whiten=True, mmps_adaptive_weight=0.30,
+            )
+            rec = TemperatureReconstructor(args, ckpt)
+            if task == "sensors":
+                self.assertEqual(rec.maxiter, 24)
+            self.assertTrue(rec.mmps_channel_whiten)
+            self.assertAlmostEqual(rec.mmps_adaptive_weight, 0.30)
+            obs = rec.operator.measure(target)
+            proj, raw, diag = rec.reconstruct(obs, seed=0)
+            self.assertTrue(torch.isfinite(proj).all().item())
+            self.assertLessEqual(diag["max_score_to_noise_norm_ratio"], 0.30 + 1e-4)
 
 
 if __name__ == "__main__":

@@ -96,11 +96,11 @@ def interpolate(observation: torch.Tensor, operator: Any, method: str) -> torch.
     """Return a classical interpolation baseline for the requested task.
 
     ``harmonic`` solves the discrete Laplace equation inside a central
-    rectangular inpainting mask using Jacobi iteration. For super-resolution,
+    rectangular inpainting mask using DST-I per channel. For super-resolution,
     use ``bilinear`` or ``bicubic`` to resize to the operator's scale.
     """
-    if observation.ndim != 4 or observation.shape[1] != 1:
-        raise ValueError("observation must have shape [B,1,H,W]")
+    if observation.ndim != 4 or observation.shape[1] < 1:
+        raise ValueError("observation must have shape [B,C,H,W] with C >= 1")
     task = getattr(operator, "task", None)
 
     if task == "sr":
@@ -114,57 +114,61 @@ def interpolate(observation: torch.Tensor, operator: Any, method: str) -> torch.
 
     if task != "inpaint" or method != "harmonic":
         raise ValueError("inpainting interpolation must use method='harmonic'")
-    known = operator.mask(observation).to(device=observation.device, dtype=torch.bool)
+    if hasattr(operator, "observation_mask"):
+        known = operator.observation_mask(observation).to(device=observation.device, dtype=torch.bool)
+    else:
+        known = operator.mask(observation).to(device=observation.device, dtype=torch.bool)
     if known.shape != observation.shape:
         raise ValueError("operator mask must match the observation shape")
     missing = ~known
-    if not torch.all(missing.flatten(1).any(dim=1)):
+    if not torch.all(missing.flatten(2).any(dim=2)):
         return observation.clone()
 
     result = observation.clone()
     for batch_index in range(result.shape[0]):
-        hole = missing[batch_index, 0]
-        rows, cols = torch.where(hole)
-        top, bottom = int(rows.min()), int(rows.max()) + 1
-        left, right = int(cols.min()), int(cols.max()) + 1
-        rectangular = torch.zeros_like(hole)
-        rectangular[top:bottom, left:right] = True
-        if not torch.equal(hole, rectangular):
-            raise ValueError("harmonic interpolation requires a rectangular missing region")
-        if top == 0 or left == 0 or bottom == hole.shape[0] or right == hole.shape[1]:
-            raise ValueError("harmonic interpolation requires known pixels around the hole")
+        for ch_index in range(result.shape[1]):
+            hole = missing[batch_index, ch_index]
+            rows, cols = torch.where(hole)
+            top, bottom = int(rows.min()), int(rows.max()) + 1
+            left, right = int(cols.min()), int(cols.max()) + 1
+            rectangular = torch.zeros_like(hole)
+            rectangular[top:bottom, left:right] = True
+            if not torch.equal(hole, rectangular):
+                raise ValueError("harmonic interpolation requires a rectangular missing region")
+            if top == 0 or left == 0 or bottom == hole.shape[0] or right == hole.shape[1]:
+                raise ValueError("harmonic interpolation requires known pixels around the hole")
 
-        # Solve the five-point discrete Laplace equation in a separable
-        # orthonormal DST-I basis, with the observed ring as Dirichlet data.
-        patch = result[
-            batch_index,
-            0,
-            top - 1 : bottom + 1,
-            left - 1 : right + 1,
-        ]
-        height, width = bottom - top, right - left
-        rhs = torch.zeros((height, width), dtype=patch.dtype, device=patch.device)
-        rhs[0, :] += patch[0, 1:-1]
-        rhs[-1, :] += patch[-1, 1:-1]
-        rhs[:, 0] += patch[1:-1, 0]
-        rhs[:, -1] += patch[1:-1, -1]
+            # Solve the five-point discrete Laplace equation in a separable
+            # orthonormal DST-I basis, with the observed ring as Dirichlet data.
+            patch = result[
+                batch_index,
+                ch_index,
+                top - 1 : bottom + 1,
+                left - 1 : right + 1,
+            ]
+            height, width = bottom - top, right - left
+            rhs = torch.zeros((height, width), dtype=patch.dtype, device=patch.device)
+            rhs[0, :] += patch[0, 1:-1]
+            rhs[-1, :] += patch[-1, 1:-1]
+            rhs[:, 0] += patch[1:-1, 0]
+            rhs[:, -1] += patch[1:-1, -1]
 
-        row_indices = torch.arange(1, height + 1, dtype=patch.dtype, device=patch.device)
-        row_modes = torch.arange(1, height + 1, dtype=patch.dtype, device=patch.device)
-        row_basis = torch.sin(
-            torch.pi * row_indices[:, None] * row_modes[None, :] / (height + 1)
-        ) * (2.0 / (height + 1)) ** 0.5
-        col_indices = torch.arange(1, width + 1, dtype=patch.dtype, device=patch.device)
-        col_modes = torch.arange(1, width + 1, dtype=patch.dtype, device=patch.device)
-        col_basis = torch.sin(
-            torch.pi * col_indices[:, None] * col_modes[None, :] / (width + 1)
-        ) * (2.0 / (width + 1)) ** 0.5
+            row_indices = torch.arange(1, height + 1, dtype=patch.dtype, device=patch.device)
+            row_modes = torch.arange(1, height + 1, dtype=patch.dtype, device=patch.device)
+            row_basis = torch.sin(
+                torch.pi * row_indices[:, None] * row_modes[None, :] / (height + 1)
+            ) * (2.0 / (height + 1)) ** 0.5
+            col_indices = torch.arange(1, width + 1, dtype=patch.dtype, device=patch.device)
+            col_modes = torch.arange(1, width + 1, dtype=patch.dtype, device=patch.device)
+            col_basis = torch.sin(
+                torch.pi * col_indices[:, None] * col_modes[None, :] / (width + 1)
+            ) * (2.0 / (width + 1)) ** 0.5
 
-        eigenvalues = (
-            4.0 * torch.sin(torch.pi * row_modes / (2.0 * (height + 1))).square()[:, None]
-            + 4.0 * torch.sin(torch.pi * col_modes / (2.0 * (width + 1))).square()[None, :]
-        )
-        transformed = row_basis.transpose(0, 1) @ rhs @ col_basis
-        solution = row_basis @ (transformed / eigenvalues) @ col_basis.transpose(0, 1)
-        result[batch_index, 0, top:bottom, left:right] = solution
+            eigenvalues = (
+                4.0 * torch.sin(torch.pi * row_modes / (2.0 * (height + 1))).square()[:, None]
+                + 4.0 * torch.sin(torch.pi * col_modes / (2.0 * (width + 1))).square()[None, :]
+            )
+            transformed = row_basis.transpose(0, 1) @ rhs @ col_basis
+            solution = row_basis @ (transformed / eigenvalues) @ col_basis.transpose(0, 1)
+            result[batch_index, ch_index, top:bottom, left:right] = solution
     return result

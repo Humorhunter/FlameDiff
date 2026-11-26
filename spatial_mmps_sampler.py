@@ -77,7 +77,13 @@ def sample_mmps(
     initial_latent=None,
     strength=None,
     latent_channels=None,
+    field_channels=None,
+    latent_scale=None,
     solver_space="auto",
+    guidance_mode="mmps",
+    dps_weight=0.30,
+    mmps_adaptive_weight=None,
+    channel_weights=None,
     guidance_max_timestep=None,
     score_clip=None,
     eta=None,
@@ -146,6 +152,21 @@ def sample_mmps(
             raise ValueError("Provide either seed or generator, not both")
     if solver_space not in ("auto", "observation", "latent"):
         raise ValueError("solver_space must be one of: auto, observation, latent")
+    if guidance_mode not in ("mmps", "dps"):
+        raise ValueError("guidance_mode must be one of: mmps, dps")
+    try:
+        dps_weight = float(dps_weight)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("dps_weight must be finite and strictly positive") from None
+    if not isfinite(dps_weight) or dps_weight <= 0:
+        raise ValueError("dps_weight must be finite and strictly positive")
+    if mmps_adaptive_weight is not None:
+        try:
+            mmps_adaptive_weight = float(mmps_adaptive_weight)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("mmps_adaptive_weight must be finite and strictly positive") from None
+        if not isfinite(mmps_adaptive_weight) or mmps_adaptive_weight <= 0:
+            raise ValueError("mmps_adaptive_weight must be finite and strictly positive")
     if guidance_max_timestep is not None:
         if (
             not isinstance(guidance_max_timestep, int)
@@ -266,10 +287,40 @@ def sample_mmps(
     step_count = len(scheduler.timesteps)
     total_gmres_iterations = 0
 
+    if field_channels is None:
+        inferred_out = getattr(decoder, "out_channels", None)
+        field_channels = int(inferred_out) if inferred_out is not None else FIELD_SHAPE[0]
+    _validate_positive_int("field_channels", field_channels)
+    expected_field_shape = (field_channels, FIELD_SHAPE[1], FIELD_SHAPE[2])
+
+    scale_mean = None
+    scale_std = None
+    if latent_scale is not None:
+        scale_mean = torch.as_tensor(latent_scale["mean"], device=device, dtype=dtype).view(1, -1, 1, 1)
+        scale_std = torch.as_tensor(latent_scale["std"], device=device, dtype=dtype).view(1, -1, 1, 1)
+        if scale_mean.shape[1] != latent_channels or scale_std.shape[1] != latent_channels:
+            raise ValueError("latent_scale channel count must match latent_channels")
+        if not torch.isfinite(scale_mean).all().item() or not torch.isfinite(scale_std).all().item():
+            raise ValueError("latent_scale must contain finite values")
+        if bool((scale_std <= 0).any().item()):
+            raise ValueError("latent_scale std must be strictly positive")
+
+    def decode_standardized(std_latent):
+        raw_latent = std_latent if scale_mean is None else (std_latent * scale_std + scale_mean)
+        return decoder(raw_latent)
+
     def measure_clean(clean_latent):
-        return measure(decoder(clean_latent))
+        return measure(decode_standardized(clean_latent))
 
     step_supports_eta = "eta" in inspect.signature(scheduler.step).parameters
+
+    clip_enabled = bool(getattr(scheduler.config, "clip_sample", False))
+    clip_bound = float(getattr(scheduler.config, "clip_sample_range", 1.0))
+
+    # Optional per-observed-channel weighting tensor for balanced multi-field DPS
+    dps_ch_w = None
+    if channel_weights is not None:
+        dps_ch_w = torch.as_tensor(channel_weights, device=device, dtype=dtype)
 
     # The custom transformer uses MultiheadAttention. Disabling the fused
     # fastpath keeps the repeated forward/JVP path available on CPU and CUDA.
@@ -283,7 +334,7 @@ def sample_mmps(
             alpha_bar = alpha_schedule[timestep]
             guided = guidance_max_timestep is None or int(timestep) <= guidance_max_timestep
 
-            if guided:
+            if guided and guidance_mode == "mmps":
                 with torch.enable_grad():
                     current = latent.detach().requires_grad_(True)
                     predicted_noise = model(current, None, time_batch)
@@ -292,9 +343,14 @@ def sample_mmps(
                     if predicted_noise.shape != current.shape:
                         raise ValueError("denoiser output shape must match the latent shape")
                     clean = (current - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
+                    clean_for_meas = (
+                        clean.clamp(-clip_bound, clip_bound)
+                        if (clip_enabled and clip_bound > 1.0)
+                        else clean
+                    )
                     score, solver = mmps_guidance(
                         current,
-                        clean,
+                        clean_for_meas,
                         observation,
                         measure_clean,
                         alpha_bar,
@@ -302,6 +358,54 @@ def sample_mmps(
                         maxiter=maxiter,
                         solver_space=solver_space,
                     )
+            elif guided and guidance_mode == "dps":
+                # Adaptive Normalized DPS (Wu, Liang & Luo, Combustion & Flame 282, 2025, Eq. 18-19):
+                # scales the likelihood gradient norm to dps_weight * ||eps||_2 per step,
+                # avoiding GMRES ill-conditioning and working identically on CPU, CUDA, and MPS.
+                with torch.enable_grad():
+                    current = latent.detach().requires_grad_(True)
+                    predicted_noise = model(current, None, time_batch)
+                    if not isinstance(predicted_noise, torch.Tensor):
+                        raise TypeError("denoiser must return an epsilon tensor")
+                    if predicted_noise.shape != current.shape:
+                        raise ValueError("denoiser output shape must match the latent shape")
+                    clean = (current - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
+                    clean_for_meas = (
+                        clean.clamp(-clip_bound, clip_bound) if clip_enabled else clean
+                    )
+                    measured = measure_clean(clean_for_meas)
+                    residual = observation - measured
+                    if dps_ch_w is not None:
+                        if dps_ch_w.shape == residual.shape:
+                            loss_val = 0.5 * (residual.square() * dps_ch_w).sum()
+                        elif residual.ndim >= 3 and residual.shape[1] == dps_ch_w.numel():
+                            view_shape = (1, -1) + (1,) * (residual.ndim - 2)
+                            loss_val = 0.5 * (residual.square() * dps_ch_w.view(view_shape)).sum()
+                        else:
+                            loss_val = 0.5 * residual.square().sum()
+                    else:
+                        loss_val = 0.5 * residual.square().sum()
+                    grad_cur, = torch.autograd.grad(loss_val, current)
+                with torch.no_grad():
+                    eps_norm_t = torch.linalg.vector_norm(predicted_noise.detach())
+                    grad_norm_t = torch.linalg.vector_norm(grad_cur.detach())
+                    denom_alpha = (1.0 - alpha_bar).sqrt().clamp_min(1e-8)
+                    if float(grad_norm_t.item()) > 1e-12:
+                        # _posterior_noise uses eps_cond = eps - sqrt(1-ab)*score, so
+                        # moving z toward -grad_cur means score = -(dps_weight * ||eps|| / ||grad||) * grad / sqrt(1-ab)
+                        score = -(dps_weight * eps_norm_t / grad_norm_t / denom_alpha) * grad_cur.detach()
+                    else:
+                        score = torch.zeros_like(predicted_noise)
+                    solver = {
+                        "relative_residual": 0.0,
+                        "iterations": 1.0,
+                        "converged": 1.0,
+                        "breakdown": 0.0,
+                        "measurement_rmse": float(residual.detach().square().mean().sqrt().item()),
+                        "sigma": float(sigma),
+                        "alpha_bar": float(alpha_bar.item()),
+                        "solver_space": "adaptive_dps",
+                    }
             else:
                 with torch.no_grad():
                     current = latent.detach()
@@ -327,11 +431,18 @@ def sample_mmps(
                 eps_norm = float(torch.linalg.vector_norm(predicted_noise.detach()).item())
                 correction = (1 - alpha_bar).sqrt() * score
                 corr_norm = float(torch.linalg.vector_norm(correction).item())
-                if score_clip is not None and corr_norm > 0.0:
-                    max_corr = score_clip * max(eps_norm, 1e-12)
-                    if corr_norm > max_corr:
-                        score = score * (max_corr / corr_norm)
-                        corr_norm = max_corr
+                if guidance_mode == "mmps":
+                    if mmps_adaptive_weight is not None and corr_norm > 1e-12:
+                        # Wu et al. (2025, Eq. 18-19) adaptive norm matching applied directly
+                        # to MMPS's exact covariance-inverted likelihood score direction.
+                        target_corr = mmps_adaptive_weight * max(eps_norm, 1e-12)
+                        score = score * (target_corr / corr_norm)
+                        corr_norm = target_corr
+                    elif score_clip is not None and corr_norm > 0.0:
+                        max_corr = score_clip * max(eps_norm, 1e-12)
+                        if corr_norm > max_corr:
+                            score = score * (max_corr / corr_norm)
+                            corr_norm = max_corr
 
                 conditioned_noise = _posterior_noise(predicted_noise, score, alpha_bar)
                 step_kwargs = {"generator": generator}
@@ -377,9 +488,12 @@ def sample_mmps(
         torch.backends.mha.set_fastpath_enabled(previous_mha_fastpath)
 
     with torch.no_grad():
-        field = decoder(latent)
-        if not isinstance(field, torch.Tensor) or tuple(field.shape[1:]) != FIELD_SHAPE:
-            raise ValueError(f"decoder must return [B, {FIELD_SHAPE[0]}, {FIELD_SHAPE[1]}, {FIELD_SHAPE[2]}]")
+        field = decode_standardized(latent)
+        if not isinstance(field, torch.Tensor) or tuple(field.shape[1:]) != expected_field_shape:
+            raise ValueError(
+                f"decoder must return [B, {expected_field_shape[0]}, "
+                f"{expected_field_shape[1]}, {expected_field_shape[2]}]"
+            )
         if not torch.isfinite(field).all().item():
             raise FloatingPointError("decoder produced a non-finite temperature field")
         raw_measurement = measure(field)

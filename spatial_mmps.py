@@ -249,15 +249,39 @@ def mmps_guidance(
         )
         return gradient
 
-    def measurement_jvp(tangent):
-        tangent = tangent.to(dtype=clean.dtype)
-        with torch.no_grad(), forward_ad.dual_level():
-            dual_input = forward_ad.make_dual(clean.detach(), tangent.detach())
-            dual_output = measure(dual_input)
-            result = forward_ad.unpack_dual(dual_output).tangent
-            if result is None:
-                return torch.zeros_like(dual_output)
-            return result
+    use_double_vjp = clean.device.type == "mps"
+    if use_double_vjp:
+        # PyTorch MPS does not yet implement forward-mode AD for all linear/conv ops;
+        # use exact reverse-over-reverse (double-VJP) JVP so MMPS works natively on MPS.
+        clean_det = clean.detach().requires_grad_(True)
+        meas_det = measure(clean_det)
+        dummy_cot = torch.zeros_like(meas_det, requires_grad=True)
+        dummy_vjp, = torch.autograd.grad(
+            meas_det, clean_det, grad_outputs=dummy_cot, create_graph=True
+        )
+
+        def measurement_jvp(tangent):
+            tangent = tangent.to(dtype=clean.dtype)
+            res, = torch.autograd.grad(
+                dummy_vjp,
+                dummy_cot,
+                grad_outputs=tangent.detach(),
+                retain_graph=True,
+                allow_unused=True,
+            )
+            if res is None:
+                return torch.zeros_like(meas_det)
+            return res.detach()
+    else:
+        def measurement_jvp(tangent):
+            tangent = tangent.to(dtype=clean.dtype)
+            with torch.no_grad(), forward_ad.dual_level():
+                dual_input = forward_ad.make_dual(clean.detach(), tangent.detach())
+                dual_output = measure(dual_input)
+                result = forward_ad.unpack_dual(dual_output).tangent
+                if result is None:
+                    return torch.zeros_like(dual_output)
+                return result
 
     sigma_squared = sigma_value * sigma_value
     rhs_work = rhs.detach().to(dtype=work_dtype)

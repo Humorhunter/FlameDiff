@@ -51,18 +51,35 @@ class SpatialObservation:
         return field
 
 
-def diffusion_scheduler(train_steps=1000):
+def diffusion_scheduler(train_steps=1000, *, beta_schedule="linear", clip_sample=True):
     return DDPMScheduler(
         num_train_timesteps=train_steps,
         prediction_type="epsilon",
-        clip_sample=True,
+        beta_schedule=beta_schedule,
+        clip_sample=clip_sample,
         timestep_spacing="linspace",
     )
 
 
-def diffusion_loss(model, autoencoder, scheduler, target, generator=None):
+def standardize_latent(latent, latent_scale):
+    if latent_scale is None:
+        return latent
+    mean = torch.as_tensor(latent_scale["mean"], dtype=latent.dtype, device=latent.device).view(1, -1, 1, 1)
+    std = torch.as_tensor(latent_scale["std"], dtype=latent.dtype, device=latent.device).view(1, -1, 1, 1)
+    return (latent - mean) / std
+
+
+def unstandardize_latent(latent, latent_scale):
+    if latent_scale is None:
+        return latent
+    mean = torch.as_tensor(latent_scale["mean"], dtype=latent.dtype, device=latent.device).view(1, -1, 1, 1)
+    std = torch.as_tensor(latent_scale["std"], dtype=latent.dtype, device=latent.device).view(1, -1, 1, 1)
+    return latent * std + mean
+
+
+def diffusion_loss(model, autoencoder, scheduler, target, generator=None, *, latent_scale=None):
     with torch.no_grad():
-        latent = autoencoder.encoder(target)
+        latent = standardize_latent(autoencoder.encoder(target), latent_scale)
         noise = torch.randn(
             latent.shape, dtype=latent.dtype, device=latent.device, generator=generator
         )
