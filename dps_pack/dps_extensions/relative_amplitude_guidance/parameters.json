@@ -1,0 +1,32 @@
+{
+  "beta": 0.23745060666879275,
+  "tested_steps": [
+    500,
+    1000
+  ],
+  "fixed_strength_controls": [
+    {
+      "steps": 500,
+      "zeta": 1.0
+    },
+    {
+      "steps": 500,
+      "zeta": 2.0
+    },
+    {
+      "steps": 1000,
+      "zeta": 1.0
+    }
+  ],
+  "base": {
+    "ae_sha256": "a9736156d4871e7830a946a8844a3b452f38dd54b27829ad3ffe09adaa79b3f9",
+    "prior_sha256": "2e0d6c6930310f7b2f27b8d31f252180991549cd71ba11780ef4caf1b44919d3",
+    "min": 304.6341857910156,
+    "max": 1630.6864013671875
+  },
+  "calibration_case": "T1050-a36-f50",
+  "calibration_seeds": [
+    10400,
+    10401
+  ]
+}

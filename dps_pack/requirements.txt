@@ -1,0 +1,4 @@
+# Install PyTorch and matching torchvision for your CPU/CUDA environment first.
+numpy>=1.24
+diffusers==0.32.2
+azula==0.11.1

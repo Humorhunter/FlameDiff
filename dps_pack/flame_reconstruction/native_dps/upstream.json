@@ -1,0 +1,9 @@
+{
+  "package": "azula",
+  "version": "0.11.1",
+  "entry": "azula.guidance.dps.DPSSampler",
+  "sha256": {
+    "guidance/dps.py": "b389ae12d543377b05dc548bd4a8c56c7cc25a1ac9793987dada87071e84a4a6",
+    "sample.py": "82002c1cb31a7864bdfc0332463146d05dab6676da2a4772f582c6360e340e9d"
+  }
+}

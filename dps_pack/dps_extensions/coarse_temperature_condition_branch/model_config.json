@@ -1,0 +1,25 @@
+{
+  "ae": {
+    "file": "weights/autoencoder.pt",
+    "sha256": "67dacbc1d05708b7091a460e3751dc0443960fb161acc8e541c2a4b7e9f1e3ec",
+    "source_sha256": "67dacbc1d05708b7091a460e3751dc0443960fb161acc8e541c2a4b7e9f1e3ec"
+  },
+  "prior": {
+    "file": "weights/diffusion_prior.pt",
+    "sha256": "00f7f2e970bb245239b9e9049f99c9267bc559907cc243119a65e401a98c2810",
+    "source_sha256": "81b4327362e924b14957e1606325cb4a034de400d488c84574e17895658a60a8",
+    "training_steps": 65160
+  },
+  "normalization_K": [
+    304.6579284667969,
+    1617.9052734375
+  ],
+  "adapter": {
+    "file": "weights/condition_branch.pt",
+    "sha256": "3f314aa653127fe3643b1b0eb2b0df3a9cba785c9c9efd7441bc3957cd273920",
+    "steps": 600,
+    "lr": 0.0001,
+    "seed": 42,
+    "source_sha256": "268d2dabd5dd964f8cd599b097f601c1de7a9b016fdc7831e5a4d2658eaf6101"
+  }
+}
