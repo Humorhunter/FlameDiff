@@ -1,0 +1,1 @@
+checkpoints/flame-epoch=3299-val_loss=0.01.ckpt filter=lfs diff=lfs merge=lfs -text
