@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fourier-eval-plus"
+version = "1.1.0"
+description = "Standalone directional Fourier and spatial evaluation of scalar fields"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7", "Pillow>=9"]
+
+[project.scripts]
+fourier-eval = "fourier_eval_plus.runner:main"
+fourier-eval-verify = "fourier_eval_plus.verify:main"
+fourier-eval-dps = "fourier_eval_plus.dps_inputs:main"
+
+[tool.setuptools]
+packages = ["fourier_eval_plus", "fourier_eval_plus.methods"]
+package-dir = {fourier_eval_plus = "."}

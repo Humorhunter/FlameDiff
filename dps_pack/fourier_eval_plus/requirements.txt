@@ -1,0 +1,5 @@
+# Numeric API and --no-figures require NumPy only (Python >= 3.10).
+numpy>=1.24
+# Plotting dependencies; omit these in a numeric-only environment.
+matplotlib>=3.7
+Pillow>=9.0

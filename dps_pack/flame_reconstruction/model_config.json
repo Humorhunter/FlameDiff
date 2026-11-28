@@ -1,0 +1,18 @@
+{
+  "ae": {
+    "file": "multicondition_autoencoder/autoencoder.pt",
+    "sha256": "a9736156d4871e7830a946a8844a3b452f38dd54b27829ad3ffe09adaa79b3f9",
+    "source_sha256": "a9736156d4871e7830a946a8844a3b452f38dd54b27829ad3ffe09adaa79b3f9",
+    "training_steps": 33121
+  },
+  "prior": {
+    "file": "multicondition_diffusion_prior/diffusion_prior.pt",
+    "sha256": "ef0ebdcabd7772ce94062c6aae814cf11a02357c1c06ffb0dce07a59cb42f2a2",
+    "source_sha256": "2e0d6c6930310f7b2f27b8d31f252180991549cd71ba11780ef4caf1b44919d3",
+    "training_steps": 66094
+  },
+  "normalization_K": [
+    304.6341857910156,
+    1630.6864013671875
+  ]
+}
